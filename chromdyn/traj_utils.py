@@ -147,20 +147,69 @@ class Analyzer:
         return results
 
     @staticmethod
-    def compute_RG(positions: np.ndarray) -> float | np.ndarray:
+    def compute_RG(positions: np.ndarray, return_components: bool = False) -> Union[float, np.ndarray, Tuple]:
+        """
+        Calculates the Radius of Gyration (Rg).
+        
+        Args:
+            positions: Coordinates array of shape (N, 3) or (T, N, 3).
+            return_components: If True, returns a tuple (rg_total, rg_xyz).
+                               rg_xyz will contain [rg_x, rg_y, rg_z].
+        """
+        # receive traj.xyz() as positions
         positions = np.asarray(positions)
 
-        if positions.ndim == 2:  # shape (N, 3)
+        # ---------------------------------------------------------
+        # Case 1: Single Frame (N, 3)
+        # ---------------------------------------------------------
+        if positions.ndim == 2:
+            # 1. Calculate Center of Mass
             center_of_mass = np.mean(positions, axis=0)
-            squared_distances = np.sum((positions - center_of_mass) ** 2, axis=1)
-            return float(np.sqrt(np.mean(squared_distances)))
+            
+            # 2. Calculate squared deviations for each dimension (x, y, z) separately
+            # Shape remains (N, 3) here
+            sq_deviations = (positions - center_of_mass) ** 2
+            
+            # 3. Mean over particles (N) to get squared Rg components
+            # Shape becomes (3,) -> [Rgx^2, Rgy^2, Rgz^2]
+            rg_sq_components = np.mean(sq_deviations, axis=0)
+            
+            # 4. Calculate Total Rg
+            # Rg = sqrt(Rgx^2 + Rgy^2 + Rgz^2)
+            rg_total = float(np.sqrt(np.sum(rg_sq_components)))
 
-        elif positions.ndim == 3:  # shape (T, N, 3)
-            centers_of_mass = np.mean(positions, axis=1)  # shape (T, 3)
-            squared_distances = np.sum(
-                (positions - centers_of_mass[:, None, :]) ** 2, axis=2
-            )  # (T, N)
-            return np.sqrt(np.mean(squared_distances, axis=1))  # shape (T,)
+            if return_components:
+                rg_xyz = np.sqrt(rg_sq_components) # Shape (3,)
+                return rg_total, rg_xyz
+            else:
+                return rg_total
+
+        # ---------------------------------------------------------
+        # Case 2: Trajectory (T, N, 3)
+        # ---------------------------------------------------------
+        elif positions.ndim == 3:
+            # 1. Calculate Centers of Mass
+            # Shape (T, 3)
+            centers_of_mass = np.mean(positions, axis=1)
+            
+            # 2. Calculate squared deviations
+            # Use broadcasting: (T, N, 3) - (T, 1, 3)
+            sq_deviations = (positions - centers_of_mass[:, None, :]) ** 2
+            
+            # 3. Mean over particles (axis 1) to get squared Rg components
+            # Shape becomes (T, 3)
+            rg_sq_components = np.mean(sq_deviations, axis=1)
+            
+            # 4. Calculate Total Rg per frame
+            # Sum over xyz (axis 1 of the component array), then sqrt
+            # Shape (T,)
+            rg_total = np.sqrt(np.sum(rg_sq_components, axis=1))
+
+            if return_components:
+                rg_xyz = np.sqrt(rg_sq_components) # Shape (T, 3)
+                return rg_total, rg_xyz
+            else:
+                return rg_total
 
         else:
             raise ValueError(
@@ -850,22 +899,28 @@ class Trajectory:
         return info
 
     # As requested, this function is added to the Trajectory class
-    def compute_rg_type(self):
+    def compute_rg_type(self, get_components: bool = False):
         """
         Function to compute Radius of Gyration (Rg) classified by particle type.
 
         Parameters:
-            traj: Trajectory object, which must contain the following attributes:
-                - traj.xyz: Coordinate array with shape (T, N, 3)
-                - traj.chrom_seq: A list or array of length N, containing bead types (e.g., 'A', 'B')
+            get_components (bool): If True, returns both total Rg and its XYZ components.
+                                Default is False.
 
         Returns:
             results (dict): A dictionary containing Rg data.
-                            key: 'general' and each type name (e.g., 'A', 'B')
-                            value: Corresponding Rg numpy array (of length T)
+                - If get_components is False:
+                    key: 'general' and each type name (e.g., 'A', 'B')
+                    value: Corresponding Rg numpy array of shape (T,)
+                - If get_components is True:
+                    key: 'general' and each type name
+                    value: A dictionary with:
+                        - 'total': np.ndarray of shape (T,)
+                        - 'components': np.ndarray of shape (T, 3)
         """
 
         # 1. Get coordinates and sequence from SELF
+        # Dimension: (T, N, 3)
         all_positions = np.asarray(self.xyz(frames=[0, None, 1], bead_selection=None))
         bead_types = np.asarray(self.chrom_seq)
 
@@ -873,30 +928,42 @@ class Trajectory:
         results = {}
 
         # 3. Calculate 'general' Rg (all beads)
-        # Always calculate this
-        results["general"] = Analyzer.compute_RG(all_positions)
+        # Forward the get_components flag to the static method
+        results["general"] = Analyzer.compute_RG(all_positions, return_components=get_components)
 
-        # 4. Check if system is Heterogeneous
+        # 4. Check if system is Heterogeneous (异质系统)
         unique_types = np.unique(bead_types)
 
-        # If type count is greater than 1, it's a Heterogeneous (Heterogeneous) system, need to calculate by type
+        # If type count is greater than 1, calculate by type
         if len(unique_types) > 1:
             for t_type in unique_types:
-                # Create boolean mask (Boolean Mask)
-                # mask length equals beads count, True means current type
-                mask = bead_types == t_type
+                # Create Boolean Mask (布尔掩码)
+                mask = (bead_types == t_type)
 
-                # Slice
-                # Dimension meaning: [all frames, mask filtered column(beads), all coordinates]
+                # Slice positions: [all frames, filtered beads, xyz]
                 subset_positions = all_positions[:, mask, :]
 
                 # Ensure type name is string format as key
                 key_name = str(t_type)
 
-                # Calculate Rg for this type and store in dictionary
-                results[key_name] = Analyzer.compute_RG(subset_positions)
-
-        # If len(unique_types) == 1, loop is skipped, only returns general, avoid duplicate calculation
+                # 5. Calculate Rg for this type
+                # The return type of Analyzer.compute_RG depends on get_components
+                rg_data = Analyzer.compute_RG(subset_positions, return_components=get_components)
+                
+                # If get_components is True, rg_data is a tuple (total, xyz)
+                # We can store it as a sub-dictionary for better readability
+                if get_components:
+                    total_rg, xyz_rg = rg_data
+                    results[key_name] = {
+                        "total": total_rg,
+                        "components": xyz_rg
+                    }
+                    # Also update "general" to a dict format for structure consistency
+                    if key_name == str(unique_types[0]): # Only need to format "general" once
+                        gen_total, gen_xyz = results["general"]
+                        results["general"] = {"total": gen_total, "components": gen_xyz}
+                else:
+                    results[key_name] = rg_data
 
         return results
 
