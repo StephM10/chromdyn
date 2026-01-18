@@ -216,6 +216,28 @@ class Analyzer:
                 f"positions must have shape (N, 3) or (T, N, 3), got {positions.shape}"
             )
 
+    @staticmethod
+    def wrap_coordinates(positions: np.ndarray, box_vectors: np.ndarray) -> np.ndarray:
+        """
+        Convert Unwrapped coordinates to Wrapped coordinates (inside the box).
+        
+        Args:
+            positions: (..., 3) array
+            box_vectors: (3, 3) array or (3,) array of box lengths
+            
+        Returns:
+            positions_wrapped: Coordinates within [0, box_length]
+        """
+        # Handle cubic box usually stored as [Lx, Ly, Lz] or diagonals of 3x3
+        if box_vectors.shape == (3, 3):
+            box_diag = np.diag(box_vectors)
+        else:
+            box_diag = np.array(box_vectors)
+            
+        # Modulo operation handles the wrapping
+        # positions % box_diag ensures result is in [0, L)
+        return positions % box_diag
+
     # =========================================================================
     # Public Interface: VACF
     # =========================================================================
@@ -966,6 +988,88 @@ class Trajectory:
                     results[key_name] = rg_data
 
         return results
+
+    def xyz_wrapped(self, frames=[0, None, 1], bead_selection=None, xyz_cols=[0, 1, 2]):
+        """
+        Get the *WRAPPED* coordinates (inside the simulation box) for selected beads.
+        
+        This acts as a wrapper around self.xyz() but applies the periodic wrapping 
+        operation using self.box_vectors.
+        
+        Args:
+            frames (list): [start, end, step]
+            bead_selection (list/array): Indices of beads to retrieve.
+            xyz_cols (list): Indices of dimensions to retrieve.
+
+        Returns:
+            np.ndarray: Wrapped coordinates with shape (T, N, 3).
+        """
+        # 1. Get raw Unwrapped coordinates (T, N, 3)
+        # Directly reuse existing xyz function
+        coords_unwrapped = self.xyz(frames=frames, bead_selection=bead_selection, xyz_cols=xyz_cols)
+        
+        # 2. Get and process Box Vectors
+        if self.box_vectors is None:
+            # If no box information is found, cannot wrap. Return raw coordinates or raise error.
+            # Here we choose to print a warning and return original coordinates.
+            print("Warning: No box vectors found. Returning unwrapped coordinates.")
+            return coords_unwrapped
+
+        # Parse frames parameters to perform the same slicing on box_vectors
+        start, end, step = frames
+        if end is None:
+            end = self.n_frames
+        
+        # Range check - maintain consistency with xyz function logic
+        start = max(0, start)
+        end = min(end, self.n_frames)
+        
+        # Slice box data (T_subset, 3, 3)
+        # Note: Assumes box_vectors is a numpy array of shape (Total_Frames, 3, 3)
+        subset_boxes = self.box_vectors[start:end:step]
+        
+        # 3. Perform Wrapping operation
+        # Extract box diagonal lengths (Lx, Ly, Lz)
+        # Shape transformation: (T, 3, 3) -> (T, 3)
+        box_diag = np.diagonal(subset_boxes, axis1=1, axis2=2)
+        
+        # To utilize Broadcasting, reshape box_diag to (T, 1, 3)
+        # coords_unwrapped: (T, N, 3)
+        # box_diag_reshaped: (T, 1, 3)
+        box_diag_reshaped = box_diag[:, np.newaxis, :]
+        
+        # Perform wrap using modulo operator
+        # math: coords_wrapped = coords % box
+        coords_wrapped = coords_unwrapped % box_diag_reshaped
+        
+        return coords_wrapped
+
+    def check_if_wrapped(self):
+        """
+        Check if the trajectory contains breaks due to Periodic Boundary Conditions (PBC).
+        Principle: Calculate distances between adjacent beads. If distances are close to the box size, wrapping has occurred.
+        """
+        # Get coordinates of the first frame (N, 3)
+        coords = self.xyz(frames=[0, 1, 1])[0]
+
+        # Calculate adjacent bead distances: ||r_{i+1} - r_i||
+        diffs = coords[1:] - coords[:-1]
+        dists = np.linalg.norm(diffs, axis=1)
+
+        print(f"Max bond distance: {np.max(dists):.4f}")
+        print(f"Mean bond distance: {np.mean(dists):.4f}")
+
+        # Assume normal bond length is around 1.0. Large values indicate the trajectory is wrapped.
+        if np.max(dists) > 10.0:  # Threshold set to, e.g., 10 times the bond length
+            print("Warning: Extremely large bond distance detected! Data appears to be Wrapped.")
+            print("Direct Rg calculation will be incorrect! Must Unwrap first.")
+        else:
+            print(
+                "Max bond distance is normal. Data appears to be Unwrapped (continuous) or the system has not crossed boundaries."
+            )
+
+
+        
 
 
 # --- External Wrappers (For Backward Compatibility / Functional Style) ---

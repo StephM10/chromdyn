@@ -153,7 +153,7 @@ class SaveStructure:
                 if self.PBC:
                     box = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(
                         unit.nanometer
-                    )
+                    ) # Parameter enforcePeriodicbox in integrators is set to False by default
                     self.saveFile[str(self.savestep)].attrs["box"] = box
 
             else:
