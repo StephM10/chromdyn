@@ -205,7 +205,7 @@ def visualize(
     select_frame=0,
     axis_limits=None,
     colors=None,
-    outputName=None,
+    output_name=None,
     isring=False,
     r=None,
     recenter=False,
@@ -221,7 +221,7 @@ def visualize(
         select_frame (int): Frame index to visualize (default: 0).
         axis_limits (tuple): Manual axis limits as (x_min, x_max, y_min, y_max, z_min, z_max).
         colors (list): Custom colors for chains.
-        outputName (str): If provided, save the plot to this filename instead of displaying.
+        output_name (str): If provided, save the plot to this filename instead of displaying.
         isring (bool): If True, connect the last bead to the first bead (default: False).
         r (float): Physical radius of beads in nm for size calculation.
         recenter (bool): If True, recenter coordinates (default: True).
@@ -469,9 +469,9 @@ def visualize(
                 sc.set_sizes(np.full(len(sc.get_offsets()), s_phys))
 
     # --- 10. Output & Display ---
-    if outputName:
-        plt.savefig(outputName, dpi=300)
-        print(f"Plot saved to {outputName}")
+    if output_name:
+        plt.savefig(output_name, dpi=300)
+        print(f"Plot saved to {output_name}")
         plt.close(fig)
     else:
         plt.show()
@@ -484,7 +484,7 @@ def visualize_animation(
     fps=20,
     axis_limits=None,
     colors=None,
-    outputName=None,
+    output_name=None,
     isring=False,
     r=None,
     recenter=True,
@@ -502,7 +502,7 @@ def visualize_animation(
         fps (int): Frames per second for animation (default: 20).
         axis_limits (tuple): Manual axis limits as (x_min, x_max, y_min, y_max, z_min, z_max).
         colors (list): Custom colors for chains.
-        outputName (str): If provided, save animation to this filename.
+        output_name (str): If provided, save animation to this filename.
         isring (bool): If True, connect the last bead to the first bead (default: False).
         r (float): Physical radius of beads in nm for size calculation.
         recenter (bool): If True, recenter coordinates (default: True).
@@ -511,7 +511,7 @@ def visualize_animation(
         PBC (bool): If True, draw periodic boundary box and use box-based recentering (default: False).
 
     Returns:
-        Animation object if no outputName is provided.
+        Animation object if no output_name is provided.
     """
     _check_matplotlib()
 
@@ -753,14 +753,14 @@ def visualize_animation(
         fig, update, frames=num_anim_frames, interval=1000 / fps, blit=False
     )
 
-    if outputName:
+    if output_name:
         writer = (
             FFMpegWriter(fps=fps)
-            if outputName.endswith(".mp4")
+            if output_name.endswith(".mp4")
             else PillowWriter(fps=fps)
         )
-        anim.save(outputName, writer=writer, dpi=300)
-        print(f"Saved to {outputName}")
+        anim.save(output_name, writer=writer, dpi=300)
+        print(f"Saved to {output_name}")
         plt.close(fig)
     else:
         try:
@@ -782,7 +782,7 @@ def visualize_pbc_images(
     image_style="scatter",
     axis_limits=None,
     colors=None,
-    outputName=None,
+    output_name=None,
     isring=False,
     r=None,
     recenter=True,
@@ -1037,9 +1037,9 @@ def visualize_pbc_images(
             sc.set_sizes([10])
 
     # --- 8. Output ---
-    if outputName:
-        plt.savefig(outputName, dpi=300)
-        print(f"Plot saved to {outputName}")
+    if output_name:
+        plt.savefig(output_name, dpi=300)
+        print(f"Plot saved to {output_name}")
         plt.close(fig)
     else:
         plt.show()
