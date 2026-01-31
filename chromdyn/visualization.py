@@ -788,6 +788,7 @@ def visualize_pbc_images(
     recenter=True,
     color_mode="chain",
     types=None,
+    wrap=False,
 ):
     """
     Visualize central polymer AND periodic images with correct physical sizing.
@@ -822,9 +823,15 @@ def visualize_pbc_images(
     polymer_coords_orig = []
     try:
         for sel in chain_selections:
-            data = traj.xyz(
-                frames=[select_frame, select_frame + 1, 1], bead_selection=sel
-            )
+            if not wrap:
+                data = traj.xyz(
+                    frames=[select_frame, select_frame + 1, 1], bead_selection=sel
+                )
+            else:
+                data = traj.xyz_wrapped(
+                    frames=[select_frame, select_frame + 1, 1],
+                    bead_selection=sel,
+                )
             if data.shape[0] > 0:
                 polymer_coords_orig.append(np.nan_to_num(data[0]))
             else:
