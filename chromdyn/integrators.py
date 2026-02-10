@@ -98,6 +98,20 @@ class IntegratorManager:
                     self.temperature, self.friction, self.timestep
                 )
 
+            elif integrator == "active-brownian":
+                self.logger.info(
+                    f"Active BrownianIntegrator: temperature={self.temperature} | friction={self.friction} | timestep={self.timestep}"
+                )
+                self.logger.info("Initialized active parameters: F=0.0 and t_corr=1.0.")
+                self.logger.info(
+                    "These parameters are per dof variables and can be set any time using .set_active_params(F_seq, tau_seq)"
+                )
+                # self.logger.info("integrator.setPerDofVariableByName('t_corr', [Vec3(t,t,t) for t in tau_list]).")
+                self.is_active = True
+                return ActiveBrownianIntegrator(
+                    self.temperature, self.friction, self.timestep
+                )
+
         except Exception as e:
             self.logger.exception(f"[ERROR] Failed to create integrator: {e}")
             raise
@@ -125,14 +139,15 @@ class ActiveBrownianIntegrator(CustomIntegrator):
     ):
 
         # Create a new CustomIntegrator
-        super(ActiveBrownianIntegrator, self).__init__(timestep)
+        super().__init__(timestep)
 
         # add global variables
         kbT = 0.008314 * temperature
         self.addGlobalVariable("kbT", kbT)
         self.addGlobalVariable("g", collision_rate)
-        # self.addGlobalVariable("Ta", corr_time)
-        self.addPerDofVariable("Ta", corr_time)
+        # self.addGlobalVariable("t_corr", corr_time)
+        self.addPerDofVariable("t_corr", corr_time)
+        self.addPerDofVariable("F_act", 0)
         self.setConstraintTolerance(constraint_tolerance)
 
         # add attributes
@@ -147,7 +162,7 @@ class ActiveBrownianIntegrator(CustomIntegrator):
         # IMPORTANT: the force-group "0" is associated with keeping track of the active noise
         self.addComputePerDof(
             "v",
-            "(exp(- dt / Ta ) * v) + ((sqrt(1 - exp( - 2 * dt / Ta)) * f0 / g) * gaussian)",
+            "(exp(- dt / t_corr ) * v) + ((sqrt(1 - exp( - 2 * dt / t_corr)) * F_act / g) * gaussian)",
         )
         self.addConstrainVelocities()
 
@@ -158,7 +173,7 @@ class ActiveBrownianIntegrator(CustomIntegrator):
         self.addComputePerDof(
             "x", "x + (v * dt) + (dt * f / g) + (sqrt(2 * (kbT / g) * dt) * gaussian)"
         )
-        self.addComputePerDof("x", "x - (dt  * f0 / g)")
+        #self.addComputePerDof("x", "x - (dt  * F_act / g)")
 
         self.addComputePerDof("x1", "x")  # save pre-constraint positions in x1
         self.addConstrainPositions()  # x is now constrained
