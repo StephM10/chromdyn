@@ -680,6 +680,142 @@ class Analyzer:
         results["bin_centers"] = bin_centers
         return results
 
+    @staticmethod
+    def _msd_fft_cpu_batch(coords: np.ndarray, batch_size: int) -> np.ndarray:
+        """
+        (Internal) CPU implementation of MSD using numpy.fft.
+        Motivation: Utilizes vectorized numpy operations and rFFT to avoid slow Python loops.
+        """
+        M, B_total, D = coords.shape
+        msd_result = np.zeros((M, B_total), dtype=np.float32)
+        
+        # Pre-calculate denominator, shape (M, 1)
+        den = (M - np.arange(M, dtype=np.float32))[:, None]
+        
+        for start_idx in range(0, B_total, batch_size):
+            end_idx = min(start_idx + batch_size, B_total)
+            # Convert to single-precision floating point to save memory and speed up
+            r_batch = coords[:, start_idx:end_idx, :].astype(np.float32)
+            B_current = r_batch.shape[1]
+            
+            # --- Step 1: Cross Term S2 (Autocorrelation) ---
+            S2 = np.zeros((M, B_current), dtype=np.float32)
+            for dim in range(D):
+                r_1d = r_batch[:, :, dim]
+                # NumPy's rfft directly saves half of the complex calculation overhead
+                F = np.fft.rfft(r_1d, n=2 * M, axis=0)
+                power_spectrum = F.real**2 + F.imag**2
+                corr = np.fft.irfft(power_spectrum, n=2 * M, axis=0)[:M, :]
+                S2 += corr / den
+                
+            # --- Step 2: Sum of Squares Term S1 (Prefix Sum Optimization) ---
+            D_sq = np.sum(r_batch**2, axis=2)
+            Q_0 = 2.0 * np.sum(D_sq, axis=0)
+            
+            sub_terms = D_sq[:-1, :] + D_sq[M-1:0:-1, :]
+            cum_sub = np.cumsum(sub_terms, axis=0)
+            
+            zero_pad = np.zeros((1, B_current), dtype=np.float32)
+            Q_m = Q_0 - np.concatenate((zero_pad, cum_sub), axis=0)
+            S1 = Q_m / den
+            
+            # --- Step 3: Combine Results ---
+            msd_result[:, start_idx:end_idx] = S1 - 2.0 * S2
+
+        return msd_result
+
+    @staticmethod
+    def _msd_fft_gpu_batch(coords: np.ndarray, batch_size: int) -> np.ndarray:
+        """
+        (Internal) GPU implementation of MSD using cupy.fft.
+        Motivation: Offloads heavy FFT and prefix-sum calculations to CUDA cores.
+        """
+        M, B_total, D = coords.shape
+        msd_result = np.zeros((M, B_total), dtype=np.float32)
+        den_gpu = cp.asarray((M - np.arange(M, dtype=np.float32))[:, None])
+        
+        for start_idx in range(0, B_total, batch_size):
+            end_idx = min(start_idx + batch_size, B_total)
+            r_gpu = cp.asarray(coords[:, start_idx:end_idx, :], dtype=cp.float32)
+            B_current = r_gpu.shape[1]
+            
+            S2 = cp.zeros((M, B_current), dtype=cp.float32)
+            for dim in range(D):
+                r_1d = r_gpu[:, :, dim] 
+                F = cp.fft.rfft(r_1d, n=2 * M, axis=0)
+                power_spectrum = F.real**2 + F.imag**2
+                corr = cp.fft.irfft(power_spectrum, n=2 * M, axis=0)[:M, :]
+                S2 += corr / den_gpu
+                
+            D_sq = cp.sum(r_gpu**2, axis=2)
+            Q_0 = 2.0 * cp.sum(D_sq, axis=0)
+            
+            sub_terms = D_sq[:-1, :] + D_sq[M-1:0:-1, :]
+            cum_sub = cp.cumsum(sub_terms, axis=0)
+            
+            zero_pad = cp.zeros((1, B_current), dtype=cp.float32)
+            Q_m = Q_0 - cp.concatenate((zero_pad, cum_sub), axis=0)
+            S1 = Q_m / den_gpu
+            
+            msd_batch = S1 - 2.0 * S2
+            msd_result[:, start_idx:end_idx] = cp.asnumpy(msd_batch)
+            
+            # Free up memory
+            del r_gpu, S2, F, power_spectrum, corr, D_sq, sub_terms, cum_sub, Q_m, S1, msd_batch
+            cp.get_default_memory_pool().free_all_blocks()
+
+        return msd_result
+
+    @staticmethod
+    def compute_msd(
+        positions: np.ndarray, 
+        batch_size: int = 1000, 
+        platform: str = 'auto',
+        sampling_step: int = 1
+    ) -> np.ndarray:
+        """
+        Computes the Mean-Squared Displacement (MSD) for a trajectory.
+        
+        Args:
+            positions (np.ndarray): Array of coordinates with shape (n_frames, n_beads, 3).
+            batch_size (int): Number of beads to process per batch. Balances RAM/VRAM usage.
+            platform (str): 'auto', 'cpu', or 'gpu'. If 'auto', uses GPU if available.
+            
+        Returns:
+            np.ndarray: Computed MSD array of shape (n_frames, n_beads).
+        """
+        # 1. Input Validation
+        if not isinstance(positions, np.ndarray):
+            raise TypeError("Input positions must be a numpy.ndarray.")
+        if positions.ndim != 3 or positions.shape[2] != 3:
+            raise ValueError(f"Expected positions shape (n_frames, n_beads, 3), got {positions.shape}")
+            
+        platform = platform.lower()
+        if platform not in ['auto', 'cpu', 'gpu']:
+            raise ValueError("Platform must be 'auto', 'cpu', or 'gpu'.")
+        if not isinstance(sampling_step, int) or sampling_step < 1:
+            raise ValueError("sampling_step must be a positive integer.")
+
+        # 2. Platform Routing Logic
+        use_gpu = False
+        if platform == 'gpu':
+            if CUPY_AVAILABLE:
+                use_gpu = True
+            else:
+                warnings.warn("GPU requested but CuPy is not available. Falling back to CPU.")
+        elif platform == 'auto':
+            use_gpu = CUPY_AVAILABLE
+
+        positions = positions[::sampling_step, :, :]
+        
+        # 3. Execution
+        if use_gpu:
+            print(f"Computing MSD on GPU (Batch size: {batch_size})...")
+            return Analyzer._msd_fft_gpu_batch(positions, batch_size)
+        else:
+            print(f"Computing MSD on CPU (Batch size: {batch_size})...")
+            return Analyzer._msd_fft_cpu_batch(positions, batch_size)
+
 
 class TrajectoryLoader:
     """
