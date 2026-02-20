@@ -6,6 +6,7 @@ This module is an optional dependency. It requires 'matplotlib' to be installed.
 import warnings
 import numpy as np
 import itertools
+import os
 
 try:
     import matplotlib.pyplot as plt
@@ -506,7 +507,81 @@ def visualize_animation(
        we use a single collection object for GPU-accelerated rendering of bonds.
     3. Recentering: Subtracting the Center of Mass (COM) per frame eliminates the need 
        to track PBC box shifts, keeping the molecule in focus.
+
+    PARAMETERS:
+    -----------
+    traj : Trajectory object
+        The trajectory object containing coordinates and topology information.
+        Must have attributes: topology, chain_info, n_frames, and methods xyz()/xyz_wrapped().
+    
+    start_frame : int, default=0
+        Starting frame index for the animation.
+    
+    end_frame : int or None, default=None
+        Ending frame index (exclusive). If None, uses all frames (traj.n_frames).
+    
+    fps : int, default=20
+        Frames per second for the output animation.
+    
+    axis_limits : tuple or None, default=None
+        (x_min, x_max, y_min, y_max, z_min, z_max). If None, auto-calculated from data.
+    
+    colors : list or None, default=None
+        List of colors for each chain (used when color_mode='chain').
+    
+    output_name : str or None, default=None
+        Output file path for saving the animation. Behavior:
+        - None: Does not save to file. Returns the FuncAnimation object for 
+          interactive display (e.g., in Jupyter notebooks using anim.to_jshtml()).
+        - '.gif': Saves as GIF using Pillow writer (no external dependencies, 
+          most stable on HPC clusters).
+        - '.mp4', '.avi', '.mov': Saves as video using FFmpeg writer (requires 
+          properly installed ffmpeg with codec support).
+        - No extension or unknown extension: Defaults to '.gif'.
+    
+    isring : bool, default=False
+        If True, adds a bond between the last and first bead of each chain (circular topology).
+    
+    r : float or None, default=None
+        Physical bead radius in nm. If provided, marker size is calculated based on 
+        figure DPI and data range for accurate physical representation.
+    
+    recenter : bool, default=True
+        If True, subtracts the Center of Mass (COM) from each frame to keep the 
+        molecule centered. Set to False to observe overall diffusion.
+    
+    color_mode : str, default='chain'
+        Coloring scheme for beads:
+        - 'chain': Each polymer chain has a distinct color.
+        - 'type': Beads colored by their type (requires 'types' parameter or 
+          traj.chrom_seq/traj.types attribute).
+    
+    types : array-like or None, default=None
+        Array of bead types. If None, attempts to use traj.chrom_seq or traj.types.
+        Only used when color_mode='type'.
+
+    PBC : bool, default=False
+        If True, applies Periodic Boundary Condition wrapping to coordinates.
+    
+    wrap : bool, default=False
+        If True and PBC=True, uses traj.xyz_wrapped() instead of traj.xyz().
+    
+    RETURNS:
+    --------
+    anim : matplotlib.animation.FuncAnimation or None
+        - If output_name is None: Returns the animation object for interactive display.
+        - If output_name is provided: Returns None (animation saved to file).
+
+    NOTES:
+    ------
+    - GIF format (Pillow) is recommended for HPC clusters as it avoids ffmpeg 
+      dependency issues (missing codecs, CPU instruction incompatibility, etc.).
+    - MP4 format produces smaller files but requires a properly configured ffmpeg 
+      installation with H.264 codec support.
+    - For long animations with many frames, GIF files can become large. Consider 
+      reducing fps or frame count if file size is a concern.
     """
+    
     
     # --- 1. Data Preparation (Vectorized) ---
     if not hasattr(traj, "topology") or traj.topology is None:
@@ -692,18 +767,56 @@ def visualize_animation(
         fig, update, frames=num_anim_frames, interval=1000 / fps, blit=False
     )
 
-    if output_name:
-        writer = FFMpegWriter(fps=fps) if output_name.endswith(".mp4") else PillowWriter(fps=fps)
-        anim.save(output_name, writer=writer, dpi=150)
-        print(f"Saved to {output_name}")
+    if output_name is None:
+        # Do not save the animation
+        print("No output_name provided, returning animation object for display.")
         plt.close(fig)
-    else:
-        try:
-            from IPython.display import display
-            display(fig)
-        except:
-            plt.show()
         return anim
+
+    # Choose writter based on file extension
+    output_name = os.path.abspath(output_name)  
+    _, ext = os.path.splitext(output_name)
+    ext = ext.lower()
+
+    if ext == '.gif':
+        writer_backend = 'pillow'
+    elif ext == '.mp4':
+        writer_backend = 'ffmpeg'
+    elif ext == '.avi':
+        writer_backend = 'ffmpeg'
+    elif ext == '.mov':
+        writer_backend = 'ffmpeg'
+    else:
+        # Default to GIF if no extension is provided
+        print(f"Warning: Unknown extension '{ext}', defaulting to .gif")
+        output_name = os.path.splitext(output_name)[0] + '.gif'
+        writer_backend = 'pillow'
+    
+    print(f"Saving animation to {output_name} using writer='{writer_backend}'...")
+
+    try:
+        if writer_backend == 'ffmpeg':
+            anim.save(
+                output_name, 
+                writer='ffmpeg', 
+                fps=fps, 
+                dpi=150,
+                extra_args=['-vcodec', 'h264', '-pix_fmt', 'yuv420p']
+            )
+        else:  # pillow
+            anim.save(
+                output_name, 
+                writer='pillow', 
+                fps=fps, 
+                dpi=150
+            )
+        print(f"Successfully saved animation to {output_name}")
+    except Exception as e:
+        print(f"Error saving animation: {e}")
+        if writer == 'ffmpeg':
+            print("Tip: Try using writer='pillow' to save as GIF instead (no ffmpeg dependency)")
+    
+    plt.close(fig)
 
 
 # This function actually relies on the topology format inside cndb files
@@ -725,8 +838,154 @@ def visualize_pbc_images(
     wrap=False,
 ):
     """
-    Visualize central polymer AND periodic images with correct physical sizing.
+    Visualize polymer chains with Periodic Boundary Condition (PBC) periodic images.
+    
+    This function renders the central polymer chain along with its periodic images
+    across neighboring simulation boxes, providing a complete view of the system
+    under PBC. Useful for verifying chain continuity across box boundaries and
+    visualizing entanglement between periodic images.
+    
+    MOTIVATION:
+    1. PBC Continuity: Shows how polymer chains connect across periodic boundaries,
+       essential for verifying simulation correctness.
+    2. Entanglement Visualization: Reveals inter-chain entanglements that span
+       multiple periodic images.
+    3. Physical Accuracy: Supports physical bead sizing based on radius (r) for
+       publication-quality figures with correct scale representation.
+    4. Visual Hierarchy: Central chain is emphasized while periodic images are
+       rendered with reduced alpha/size to maintain visual clarity.
+    
+    PARAMETERS:
+    -----------
+    traj : Trajectory object
+        The trajectory object containing coordinates, topology, and box vectors.
+        Must have attributes: topology, chain_info, box_vectors, and methods 
+        xyz()/xyz_wrapped().
+    
+    select_frame : int, default=0
+        Frame index to visualize. Use different values to inspect different 
+        snapshots of the simulation.
+    
+    n_layers : int, default=1
+        Number of periodic image layers in each direction. 
+        - n_layers=0: Central box only
+        - n_layers=1: 3*3*3 = 27 boxes (central + 26 images)
+        - n_layers=2: 5*5*5 = 125 boxes
+        Higher values show more context but increase rendering time.
+    
+    image_alpha : float, default=0.15
+        Transparency (alpha) value for periodic image chains (0.0 to 1.0).
+        Lower values make images more faint, emphasizing the central chain.
+    
+    image_style : str, default='scatter'
+        Rendering style for periodic images:
+        - 'scatter': Show beads as points (emphasizes particle positions)
+        - 'line': Show bonds as lines (emphasizes chain connectivity)
+        - 'both': Show both beads and bonds equally
+    
+    axis_limits : tuple or None, default=None
+        (x_min, x_max, y_min, y_max, z_min, z_max). If None, auto-calculated 
+        from all plotted points (central + images) with 55% buffer.
+    
+    colors : list or None, default=None
+        List of colors for each chain (used when color_mode='chain'). If None,
+        uses matplotlib 'tab10' colormap cyclically.
+    
+    output_name : str or None, default=None
+        Output file path for saving the figure. Behavior:
+        - None: Displays figure interactively using plt.show() (suitable for 
+          Jupyter notebooks or interactive sessions).
+        - str (e.g., 'pbc_vis.png'): Saves figure to file at 300 DPI and closes.
+        Supported formats: .png, .pdf, .svg, .jpg, etc. (matplotlib backend dependent)
+    
+    isring : bool, default=False
+        If True, adds a bond between the last and first bead of each chain 
+        (circular/closed-loop topology).
+    
+    r : float or None, default=None
+        Physical bead radius in nm (or simulation length units). If provided:
+        - Marker sizes are calculated based on figure DPI and data range
+        - Central chain beads use full physical size
+        - Periodic image beads use 40% of physical size (for visual hierarchy)
+        - Projection type set to 'ortho' for accurate size representation
+        If None, uses default marker sizes (central=20, images=10).
+    
+    recenter : bool, default=True
+        If True, re-centers the system so the central chain's Center of Mass 
+        (COM) is at the origin. This keeps the molecule in focus regardless of 
+        diffusion. Set to False to see absolute positions in the simulation box.
+    
+    color_mode : str, default='chain'
+        Coloring scheme for beads:
+        - 'chain': Each polymer chain has a distinct color (good for tracking 
+          individual chains across PBC).
+        - 'type': Beads colored by their type/monomer species (requires 'types' 
+          parameter or traj.chrom_seq/traj.types attribute).
+    
+    types : array-like or None, default=None
+        Array of bead types (length = total beads). If None, attempts to use 
+        traj.chrom_seq or traj.types. Only used when color_mode='type'.
+    
+    wrap : bool, default=False
+        If True, uses traj.xyz_wrapped() to apply PBC wrapping to coordinates 
+        before visualization. If False, uses raw coordinates (may show chains 
+        extending outside the box).
+    
+    RETURNS:
+    --------
+    None
+        - If output_name is provided: Figure is saved to file.
+        - If output_name is None: Figure is displayed interactively.
+    
+    EXAMPLES:
+    ---------
+    # Interactive display (Jupyter notebook)
+    visualize_pbc_images(traj, select_frame=100, n_layers=1)
+    
+    # Save as high-resolution PNG for publication
+    visualize_pbc_images(
+        traj, 
+        select_frame=0, 
+        n_layers=1, 
+        output_name="pbc_structure.png",
+        r=0.5,  # Physical bead radius
+        image_alpha=0.1
+    )
+    
+    # Visualize with type-based coloring
+    visualize_pbc_images(
+        traj, 
+        color_mode="type", 
+        types=bead_types,
+        output_name="pbc_by_type.pdf"
+    )
+    
+    # Show only central box (no periodic images)
+    visualize_pbc_images(traj, n_layers=0, recenter=True)
+    
+    # Large system context (5*5*5 boxes)
+    visualize_pbc_images(traj, n_layers=2, image_alpha=0.05)
+    
+    NOTES:
+    ------
+    - Requires traj.box_vectors to be available. Function will exit with error 
+      if box vectors are missing.
+    - For n_layers > 1, rendering time increases cubically (3³=27, 5³=125 boxes).
+      Use n_layers=1 for most cases; higher values only when needed.
+    - Physical sizing (r parameter) requires orthographic projection for accurate 
+      representation. Perspective projection is used when r=None.
+    - Periodic image beads are rendered at 40% size of central beads to create 
+      visual depth hierarchy.
+    - For publication figures, recommend: output_name='figure.pdf', dpi=300, 
+      r=<physical_radius>, image_alpha=0.1-0.2.
+    - If chains appear discontinuous across boundaries, try wrap=True or check 
+      simulation PBC settings.
+    
+    SEE ALSO:
+    ---------
+    visualize_animation : For creating time-series animations of polymer dynamics.
     """
+
     _check_matplotlib()
 
     # --- 1. Data Loading ---
@@ -981,251 +1240,6 @@ def visualize_pbc_images(
     if output_name:
         plt.savefig(output_name, dpi=300)
         print(f"Plot saved to {output_name}")
-        plt.close(fig)
-    else:
-        plt.show()
-
-def visualize_pbc_MIPS(
-    traj,
-    frame: int = 0,
-    # --- MIPS Specific Controls ---
-    particle_groups: dict = None,
-    mask_indices: list = None,
-    slice_config: dict = None,
-    # --- PBC & Render Controls ---
-    n_layers: int = 0,           # 0 usually enough for dense MIPS to save RAM
-    particle_r: float = 0.5,     # Physical radius for size calculation
-    box_vectors: np.ndarray = None,
-    recenter: bool = True,
-    output_name: str = None
-):
-    """
-    Advanced Visualization for MIPS/Dense Systems with Slicing and Masking.
-
-    Args:
-        traj: Trajectory object containing .xyz() and .box_vectors.
-        frame (int): Frame index to visualize.
-        
-        particle_groups (dict): Dictionary to specify colors/styles for specific indices.
-            Format:
-            {
-                "Liquid Cluster": {"indices": [0, 1, 5...], "color": "tab:red", "alpha": 1.0},
-                "Gas Phase":      {"indices": [2, 3...],    "color": "gray",    "alpha": 0.1}
-            }
-            * Any particle NOT in a group will use default style (blue, alpha=0.5).
-            
-        mask_indices (list/array): List of particle indices to HIDE completely (e.g. remove gas).
-        
-        slice_config (dict): Configuration to slice the box to see inside.
-            Format: {"axis": "z", "min": 5.0, "max": 15.0} 
-            OR      {"axis": "x", "center": 0.0, "width": 10.0}
-            
-        n_layers (int): Number of PBC layers (0 = central box only).
-        particle_r (float): Particle radius (sigma/2) for accurate size rendering.
-    """
-    
-    # --- 1. Load Data ---
-    # Load all particles for the frame
-    try:
-        # Load raw coordinates (N, 3)
-        coords = traj.xyz(frames=[frame, frame+1, 1], bead_selection=None)[0]
-    except Exception as e:
-        print(f"Error loading coordinates: {e}")
-        return
-
-    # Handle Box
-    if box_vectors is None:
-        if hasattr(traj, "box_vectors"):
-            box = traj.box_vectors[frame]
-        else:
-            print("Error: No box vectors found.")
-            return
-    else:
-        box = box_vectors
-
-    n_particles = coords.shape[0]
-    
-    # --- 2. Recenter System ---
-    # Move Center of Mass to Box Center to handle PBC splitting visuals
-    if recenter:
-        # Utilize your existing helper (wrapped in list as it expects chains)
-        coords = recenter_coordinates_v3([coords], box)[0]
-
-    # --- 3. Apply Filtering Logic (The Core MIPS Logic) ---
-    
-    # A. Global Mask (Visibility)
-    visible_mask = np.ones(n_particles, dtype=bool)
-    
-    # Apply explicit masking (e.g., hide gas particles)
-    if mask_indices is not None:
-        visible_mask[mask_indices] = False
-    
-    # B. Slicing Logic (Geometric Cut)
-    if slice_config:
-        axis_map = {'x': 0, 'y': 1, 'z': 2}
-        ax_idx = axis_map.get(slice_config.get('axis', 'z').lower(), 2)
-        
-        # Determine range
-        if 'min' in slice_config and 'max' in slice_config:
-            v_min, v_max = slice_config['min'], slice_config['max']
-        elif 'center' in slice_config and 'width' in slice_config:
-            c, w = slice_config['center'], slice_config['width']
-            v_min, v_max = c - w/2, c + w/2
-        else:
-            v_min, v_max = -np.inf, np.inf
-            
-        # Update mask based on coordinates
-        # Note: We check coords RELATIVE to box center if recentered, 
-        # but usually slicing is easier in absolute coords. 
-        # Here we slice based on the current `coords` values.
-        pos_axis = coords[:, ax_idx]
-        slice_mask = (pos_axis >= v_min) & (pos_axis <= v_max)
-        visible_mask = visible_mask & slice_mask
-
-    # Get indices of particles that survived masking and slicing
-    final_indices = np.where(visible_mask)[0]
-    
-    if len(final_indices) == 0:
-        print("Warning: No particles visible after masking/slicing.")
-        return
-
-    # Filter coordinates
-    active_coords = coords[final_indices]
-    
-    # --- 4. Style Assignment ---
-    # Default Arrays
-    colors = np.full(len(final_indices), 'tab:blue', dtype=object)
-    alphas = np.full(len(final_indices), 0.5, dtype=float)
-    
-    # Map original global indices to the new local sliced indices
-    # global_to_local[global_id] -> local_id in active_coords
-    global_to_local = {gid: lid for lid, gid in enumerate(final_indices)}
-
-    legend_elements = []
-
-    # Apply Groups
-    if particle_groups:
-        for label, props in particle_groups.items():
-            g_indices = props.get('indices', [])
-            g_color = props.get('color', 'tab:red')
-            g_alpha = props.get('alpha', 0.8)
-            
-            # Find which of these group indices are actually visible
-            valid_g_indices = [idx for idx in g_indices if idx in global_to_local]
-            local_indices = [global_to_local[idx] for idx in valid_g_indices]
-            
-            if local_indices:
-                colors[local_indices] = g_color
-                alphas[local_indices] = g_alpha
-                
-                # Add to legend
-                legend_elements.append(plt.Line2D([0], [0], marker='o', color='w', 
-                                                markerfacecolor=g_color, label=label, 
-                                                markersize=10, alpha=g_alpha))
-
-    # --- 5. Plotting Setup ---
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # Setup PBC Shifts
-    shifts = list(itertools.product(range(-n_layers, n_layers + 1), repeat=3))
-    vec_a, vec_b, vec_c = box[0], box[1], box[2]
-    
-    scatters_store = [] # Store artists for resizing
-
-    print(f"Rendering {len(active_coords)} particles x {len(shifts)} images...")
-
-    # Loop shifts
-    for i, j, k in shifts:
-        is_central = (i==0 and j==0 and k==0)
-        shift_vec = i*vec_a + j*vec_b + k*vec_c
-        
-        shifted_pos = active_coords + shift_vec
-        
-        # Draw Scatter
-        # Note: We must plot color groups separately or pass arrays. 
-        # Passing arrays is faster.
-        
-        # Alpha handling: 
-        # Matplotlib scatter doesn't support array of alphas easily in 3D.
-        # We assume uniform alpha PER GROUP call, or simply use the dominant alpha.
-        # Strategy: Plot group by group for correct alpha handling.
-        
-        # 1. Plot "Default" (Blue) particles not in specific groups? 
-        # Actually, passing RGBA color array handles opacity if colors are RGBA tuples.
-        # But 'tab:blue' is string.
-        # Simplification: Use a loop over unique styles for efficiency.
-        
-        # Optimization: Just plot everything once per shift if list is small,
-        # otherwise scatter supports c=array.
-        
-        # Let's plot the whole cloud at once for speed, assume average alpha or 
-        # just iterate unique colors if fidelity is needed. 
-        # For MIPS, 'dense' part is opaque, 'gas' is transparent. 
-        
-        # Split by unique (color, alpha) combo would be best, but let's try simple scatter first.
-        # We will use the 'colors' array directly. Matplotlib handles list of colors.
-        
-        # Adjust alpha for PBC images (fade them out)
-        image_fade = 1.0 if is_central else 0.3
-        
-        # Construct RGBA array manually to handle per-particle alpha
-        # This is robust.
-        from matplotlib.colors import to_rgba_array
-        rgba_colors = to_rgba_array(colors)
-        rgba_colors[:, 3] = alphas * image_fade # Apply alpha
-        
-        sc = ax.scatter(
-            shifted_pos[:, 0], shifted_pos[:, 1], shifted_pos[:, 2],
-            c=rgba_colors,
-            s=10, # Placeholder size
-            edgecolors='none', # Speed up
-            depthshade=False # Accurate colors
-        )
-        scatters_store.append(sc)
-        
-        if is_central:
-             _draw_generic_box(ax, box, color='k', alpha=0.8)
-
-    # --- 6. Limits & View ---
-    # Set limits based on box size * layers
-    center = np.sum(box, axis=0) * 0.5 # Approximation if box is orthogonal-ish
-    # Or just use the box vectors to determine span
-    max_dim = np.max(np.linalg.norm(box, axis=1))
-    span = max_dim * (n_layers + 0.6)
-    
-    ax.set_xlim(-span, span)
-    ax.set_ylim(-span, span)
-    ax.set_zlim(-span, span)
-    
-    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
-    
-    if slice_config:
-        ax.set_title(f"MIPS Slice View ({slice_config})")
-    else:
-        ax.set_title("MIPS 3D View")
-
-    if legend_elements:
-        ax.legend(handles=legend_elements)
-
-    # --- 7. Accurate Physical Sizing ---
-    # Use the magic formula from your previous code
-    fig.canvas.draw()
-    bbox = ax.get_window_extent()
-    data_range = span * 2 # Roughly the visible axis range
-    
-    if bbox and data_range > 0:
-        points_per_unit = (bbox.width * 72 / fig.get_dpi()) / data_range
-        s_phys = np.pi * ((particle_r * points_per_unit) ** 2)
-        
-        # Update all scatters
-        for sc in scatters_store:
-            sc.set_sizes([s_phys] * len(sc.get_offsets()))
-
-    # --- 8. Save ---
-    if output_name:
-        plt.savefig(output_name, dpi=300)
-        print(f"Saved to {output_name}")
         plt.close(fig)
     else:
         plt.show()
