@@ -134,7 +134,10 @@ def recenter_coordinates_v3(polymer_coords_list, box_vectors):
     # 2. Calculate Box Geometric Center
     # Center = Origin + 0.5 * (vec_a + vec_b + vec_c)
     # Assuming origin is (0,0,0)
-    box_center = 0.5 * np.sum(box_vectors, axis=0)
+    if box_vectors is not None:
+        box_center = 0.5 * np.sum(box_vectors, axis=0)
+    else:
+        box_center = np.array([0.0, 0.0, 0.0])
 
     # 3. Shift
     shift_vector = box_center - current_com
@@ -280,15 +283,14 @@ def visualize(
         print(f"Error: No valid coordinate data found for frame {select_frame}.")
         return
 
+    box_vectors = None
+    # --- 3. Load Box Vectors ---
+    if hasattr(traj, "box_vectors") and (traj.box_vectors is not None):
+        try:
+            box_vectors = traj.box_vectors[select_frame]
+        except Exception:
+            pass  # Fallback below
     if PBC:
-        # --- 3. Load Box Vectors ---
-        box_vectors = None
-        if hasattr(traj, "box_vectors") and (traj.box_vectors is not None):
-            try:
-                box_vectors = traj.box_vectors[select_frame]
-            except Exception:
-                pass  # Fallback below
-
         if box_vectors is None:
             print("Warning: No box vectors found. Assuming 100nm cube.")
             box_vectors = np.eye(3) * 100.0
@@ -401,14 +403,15 @@ def visualize(
         )
         scatter_collections.append(sc)
 
-    if PBC:
-        # --- 7. Draw PBC Box ---
-        box_corners = _draw_generic_box(ax, box_vectors)
 
         # Labels & Legend
         ax.set_xlabel(r"X ($\sigma$)")
         ax.set_ylabel(r"Y ($\sigma$)")
         ax.set_zlabel(r"Z ($\sigma$)")
+
+    if PBC:
+        # --- 7. Draw PBC Box ---
+        box_corners = _draw_generic_box(ax, box_vectors)
 
         if color_mode == "type":
             ax.legend(handles=type_legend_handles.values(), loc="best")
@@ -419,6 +422,8 @@ def visualize(
         if recenter:
             title_str += " (Recentered)"
         ax.set_title(title_str)
+    else:
+        ax.set_title(f"Frame {select_frame} (c:{color_mode})")
 
     # --- 8. View & Limits ---
     if r is not None:
@@ -476,9 +481,6 @@ def visualize(
         plt.close(fig)
     else:
         plt.show()
-
-
-    
 
 
 def visualize_animation(
@@ -936,35 +938,6 @@ def visualize_pbc_images(
     None
         - If output_name is provided: Figure is saved to file.
         - If output_name is None: Figure is displayed interactively.
-    
-    EXAMPLES:
-    ---------
-    # Interactive display (Jupyter notebook)
-    visualize_pbc_images(traj, select_frame=100, n_layers=1)
-    
-    # Save as high-resolution PNG for publication
-    visualize_pbc_images(
-        traj, 
-        select_frame=0, 
-        n_layers=1, 
-        output_name="pbc_structure.png",
-        r=0.5,  # Physical bead radius
-        image_alpha=0.1
-    )
-    
-    # Visualize with type-based coloring
-    visualize_pbc_images(
-        traj, 
-        color_mode="type", 
-        types=bead_types,
-        output_name="pbc_by_type.pdf"
-    )
-    
-    # Show only central box (no periodic images)
-    visualize_pbc_images(traj, n_layers=0, recenter=True)
-    
-    # Large system context (5*5*5 boxes)
-    visualize_pbc_images(traj, n_layers=2, image_alpha=0.05)
     
     NOTES:
     ------
