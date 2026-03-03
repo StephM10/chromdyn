@@ -174,7 +174,7 @@ class ActiveBrownianIntegrator(CustomIntegrator):
         self.addComputePerDof(
             "x", "x + (v * dt) + (dt * f / g) + (sqrt(2 * (kbT / g) * dt) * gaussian)"
         )
-        #self.addComputePerDof("x", "x - (dt  * F_act / g)")
+        # self.addComputePerDof("x", "x - (dt  * F_act / g)")
 
         self.addComputePerDof("x1", "x")  # save pre-constraint positions in x1
         self.addConstrainPositions()  # x is now constrained

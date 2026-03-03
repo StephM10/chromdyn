@@ -403,7 +403,6 @@ def visualize(
         )
         scatter_collections.append(sc)
 
-
         # Labels & Legend
         ax.set_xlabel(r"X ($\sigma$)")
         ax.set_ylabel(r"Y ($\sigma$)")
@@ -493,7 +492,7 @@ def visualize_animation(
     output_name=None,
     isring=False,
     r=None,
-    recenter=True, # set it to False if you want to see the diffusion of the overall polymer
+    recenter=True,  # set it to False if you want to see the diffusion of the overall polymer
     color_mode="chain",
     types=None,
     PBC=False,
@@ -501,13 +500,13 @@ def visualize_animation(
 ):
     """
     Highly optimized visualization function for polymer dynamics.
-    
+
     MOTIVATION:
-    1. Vectorization: Python loops over chains are too slow for rendering. We use NumPy 
+    1. Vectorization: Python loops over chains are too slow for rendering. We use NumPy
        broadcasting to handle all atoms and frames simultaneously.
-    2. Line3DCollection: Instead of managing thousands of individual Line2D objects, 
+    2. Line3DCollection: Instead of managing thousands of individual Line2D objects,
        we use a single collection object for GPU-accelerated rendering of bonds.
-    3. Recentering: Subtracting the Center of Mass (COM) per frame eliminates the need 
+    3. Recentering: Subtracting the Center of Mass (COM) per frame eliminates the need
        to track PBC box shifts, keeping the molecule in focus.
 
     PARAMETERS:
@@ -515,59 +514,59 @@ def visualize_animation(
     traj : Trajectory object
         The trajectory object containing coordinates and topology information.
         Must have attributes: topology, chain_info, n_frames, and methods xyz()/xyz_wrapped().
-    
+
     start_frame : int, default=0
         Starting frame index for the animation.
-    
+
     end_frame : int or None, default=None
         Ending frame index (exclusive). If None, uses all frames (traj.n_frames).
-    
+
     fps : int, default=20
         Frames per second for the output animation.
-    
+
     axis_limits : tuple or None, default=None
         (x_min, x_max, y_min, y_max, z_min, z_max). If None, auto-calculated from data.
-    
+
     colors : list or None, default=None
         List of colors for each chain (used when color_mode='chain').
-    
+
     output_name : str or None, default=None
         Output file path for saving the animation. Behavior:
-        - None: Does not save to file. Returns the FuncAnimation object for 
+        - None: Does not save to file. Returns the FuncAnimation object for
           interactive display (e.g., in Jupyter notebooks using anim.to_jshtml()).
-        - '.gif': Saves as GIF using Pillow writer (no external dependencies, 
+        - '.gif': Saves as GIF using Pillow writer (no external dependencies,
           most stable on HPC clusters).
-        - '.mp4', '.avi', '.mov': Saves as video using FFmpeg writer (requires 
+        - '.mp4', '.avi', '.mov': Saves as video using FFmpeg writer (requires
           properly installed ffmpeg with codec support).
         - No extension or unknown extension: Defaults to '.gif'.
-    
+
     isring : bool, default=False
         If True, adds a bond between the last and first bead of each chain (circular topology).
-    
+
     r : float or None, default=None
-        Physical bead radius in nm. If provided, marker size is calculated based on 
+        Physical bead radius in nm. If provided, marker size is calculated based on
         figure DPI and data range for accurate physical representation.
-    
+
     recenter : bool, default=True
-        If True, subtracts the Center of Mass (COM) from each frame to keep the 
+        If True, subtracts the Center of Mass (COM) from each frame to keep the
         molecule centered. Set to False to observe overall diffusion.
-    
+
     color_mode : str, default='chain'
         Coloring scheme for beads:
         - 'chain': Each polymer chain has a distinct color.
-        - 'type': Beads colored by their type (requires 'types' parameter or 
+        - 'type': Beads colored by their type (requires 'types' parameter or
           traj.chrom_seq/traj.types attribute).
-    
+
     types : array-like or None, default=None
         Array of bead types. If None, attempts to use traj.chrom_seq or traj.types.
         Only used when color_mode='type'.
 
     PBC : bool, default=False
         If True, applies Periodic Boundary Condition wrapping to coordinates.
-    
+
     wrap : bool, default=False
         If True and PBC=True, uses traj.xyz_wrapped() instead of traj.xyz().
-    
+
     RETURNS:
     --------
     anim : matplotlib.animation.FuncAnimation or None
@@ -576,15 +575,14 @@ def visualize_animation(
 
     NOTES:
     ------
-    - GIF format (Pillow) is recommended for HPC clusters as it avoids ffmpeg 
+    - GIF format (Pillow) is recommended for HPC clusters as it avoids ffmpeg
       dependency issues (missing codecs, CPU instruction incompatibility, etc.).
-    - MP4 format produces smaller files but requires a properly configured ffmpeg 
+    - MP4 format produces smaller files but requires a properly configured ffmpeg
       installation with H.264 codec support.
-    - For long animations with many frames, GIF files can become large. Consider 
+    - For long animations with many frames, GIF files can become large. Consider
       reducing fps or frame count if file size is a concern.
     """
-    
-    
+
     # --- 1. Data Preparation (Vectorized) ---
     if not hasattr(traj, "topology") or traj.topology is None:
         print("Error: Topology not found.")
@@ -593,11 +591,14 @@ def visualize_animation(
     chain_info = traj.chain_info
     n_chains = len(chain_info)
     bead_counts = [c[1] for c in chain_info]
-    
+
     cumulative_indices = np.cumsum([0] + bead_counts)
-    all_bead_indices = np.concatenate([
-        np.arange(s, e) for s, e in zip(cumulative_indices[:-1], cumulative_indices[1:])
-    ])
+    all_bead_indices = np.concatenate(
+        [
+            np.arange(s, e)
+            for s, e in zip(cumulative_indices[:-1], cumulative_indices[1:])
+        ]
+    )
     total_beads = len(all_bead_indices)
 
     total_frames = traj.n_frames
@@ -612,10 +613,16 @@ def visualize_animation(
     # Load Coordinates
     try:
         if PBC and wrap:
-            data_raw = traj.xyz_wrapped(frames=[start_frame, end_frame, 1], bead_selection=all_bead_indices.tolist())
+            data_raw = traj.xyz_wrapped(
+                frames=[start_frame, end_frame, 1],
+                bead_selection=all_bead_indices.tolist(),
+            )
         else:
-            data_raw = traj.xyz(frames=[start_frame, end_frame, 1], bead_selection=all_bead_indices.tolist())
-        
+            data_raw = traj.xyz(
+                frames=[start_frame, end_frame, 1],
+                bead_selection=all_bead_indices.tolist(),
+            )
+
         data_all = np.nan_to_num(data_raw)
         if data_all.ndim == 2:
             data_all = data_all[np.newaxis, :, :]
@@ -641,7 +648,7 @@ def visualize_animation(
         types_seq = getattr(traj, "chrom_seq", getattr(traj, "types", None))
         if types is not None:
             types_seq = types
-        
+
         if types_seq is None:
             color_mode = "chain"
         else:
@@ -659,7 +666,7 @@ def visualize_animation(
         n_beads = bead_counts[i]
         start = current_idx
         end = current_idx + n_beads
-        
+
         if color_mode == "chain":
             c_val = colors[i] if (colors and i < len(colors)) else cmap(i % 10)
             atom_colors[start:end] = c_val
@@ -669,10 +676,10 @@ def visualize_animation(
             b_start = chain_indices[:-1]
             b_end = chain_indices[1:]
             bond_indices.append(np.stack((b_start, b_end), axis=1))
-            
+
             if isring:
                 bond_indices.append(np.array([[chain_indices[-1], chain_indices[0]]]))
-        
+
         current_idx += n_beads
 
     if bond_indices:
@@ -685,11 +692,18 @@ def visualize_animation(
     if axis_limits:
         x_min, x_max, y_min, y_max, z_min, z_max = axis_limits
     else:
-        flat_subset = data_all[::max(1, num_anim_frames//10)].reshape(-1, 3)
+        flat_subset = data_all[:: max(1, num_anim_frames // 10)].reshape(-1, 3)
         if flat_subset.size > 0:
             max_range = np.max(np.abs(flat_subset))
             limit = max_range * 1.2
-            x_min, x_max, y_min, y_max, z_min, z_max = -limit, limit, -limit, limit, -limit, limit
+            x_min, x_max, y_min, y_max, z_min, z_max = (
+                -limit,
+                limit,
+                -limit,
+                limit,
+                -limit,
+                limit,
+            )
         else:
             x_min, x_max, y_min, y_max, z_min, z_max = -10, 10, -10, 10, -10, 10
 
@@ -702,50 +716,60 @@ def visualize_animation(
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
     ax.set_box_aspect([1, 1, 1])
-    
+
     if r is not None:
         ax.set_proj_type("ortho")
         ax.view_init(elev=30, azim=-45)
 
     # --- 5. RESTORED SIZE CALCULATION (Original Logic) ---
     # Default size
-    s_val = 20 
-    
+    s_val = 20
+
     if r is not None:
         # Motivation: To calculate physical size, we must know the figure's pixel dimensions.
         # This requires a canvas draw, which adds a small overhead but ensures accuracy.
-        fig.canvas.draw() 
-        
+        fig.canvas.draw()
+
         # Calculate data range (max dimension)
         data_range = max(x_max - x_min, y_max - y_min, z_max - z_min)
-        
+
         # Get window extent in display pixels
         bbox = ax.get_window_extent()
-        
+
         if bbox and data_range > 0:
             # Calculate Points Per Unit (ppt)
             # bbox.width is in pixels. fig.dpi is pixels per inch. 72 points per inch.
             ppt = (bbox.width * 72 / fig.get_dpi()) / data_range
-            
+
             # Area formula: pi * radius^2
             # We clip it to avoid extremely small or large markers causing render issues
             s_phys = np.clip(np.pi * ((r * ppt) ** 2), 0.01, 50000)
             s_val = s_phys
-            print(f"Calculated physical marker size: {s_val:.2f} points^2 (for r={r} nm)")
+            print(
+                f"Calculated physical marker size: {s_val:.2f} points^2 (for r={r} nm)"
+            )
 
     # --- 6. Graphics Initialization ---
     scat = ax.scatter([], [], [], s=s_val, depthshade=True)
     scat.set_color(atom_colors)
-    
+
     line_collection = Line3DCollection([], linewidths=1.5, alpha=0.6)
     if len(all_bonds) > 0:
         bond_colors = atom_colors[all_bonds[:, 0]]
         line_collection.set_color(bond_colors)
     ax.add_collection(line_collection)
 
-    if color_mode == "type" and 'type_map' in locals():
+    if color_mode == "type" and "type_map" in locals():
         legend_handles = [
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=c, markersize=10, label=f"Type {t}")
+            plt.Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="w",
+                markerfacecolor=c,
+                markersize=10,
+                label=f"Type {t}",
+            )
             for t, c in type_map.items()
         ]
         ax.legend(handles=legend_handles, loc="upper right")
@@ -754,13 +778,13 @@ def visualize_animation(
     def update(frame_idx):
         coords = data_all[frame_idx]
         scat._offsets3d = (coords[:, 0], coords[:, 1], coords[:, 2])
-        
+
         if len(all_bonds) > 0:
             p1 = coords[all_bonds[:, 0]]
             p2 = coords[all_bonds[:, 1]]
             segments = np.stack((p1, p2), axis=1)
             line_collection.set_segments(segments)
-            
+
         ax.set_title(f"Frame {start_frame + frame_idx}")
         return scat, line_collection
 
@@ -776,48 +800,45 @@ def visualize_animation(
         return anim
 
     # Choose writter based on file extension
-    output_name = os.path.abspath(output_name)  
+    output_name = os.path.abspath(output_name)
     _, ext = os.path.splitext(output_name)
     ext = ext.lower()
 
-    if ext == '.gif':
-        writer_backend = 'pillow'
-    elif ext == '.mp4':
-        writer_backend = 'ffmpeg'
-    elif ext == '.avi':
-        writer_backend = 'ffmpeg'
-    elif ext == '.mov':
-        writer_backend = 'ffmpeg'
+    if ext == ".gif":
+        writer_backend = "pillow"
+    elif ext == ".mp4":
+        writer_backend = "ffmpeg"
+    elif ext == ".avi":
+        writer_backend = "ffmpeg"
+    elif ext == ".mov":
+        writer_backend = "ffmpeg"
     else:
         # Default to GIF if no extension is provided
         print(f"Warning: Unknown extension '{ext}', defaulting to .gif")
-        output_name = os.path.splitext(output_name)[0] + '.gif'
-        writer_backend = 'pillow'
-    
+        output_name = os.path.splitext(output_name)[0] + ".gif"
+        writer_backend = "pillow"
+
     print(f"Saving animation to {output_name} using writer='{writer_backend}'...")
 
     try:
-        if writer_backend == 'ffmpeg':
+        if writer_backend == "ffmpeg":
             anim.save(
-                output_name, 
-                writer='ffmpeg', 
-                fps=fps, 
+                output_name,
+                writer="ffmpeg",
+                fps=fps,
                 dpi=150,
-                extra_args=['-vcodec', 'h264', '-pix_fmt', 'yuv420p']
+                extra_args=["-vcodec", "h264", "-pix_fmt", "yuv420p"],
             )
         else:  # pillow
-            anim.save(
-                output_name, 
-                writer='pillow', 
-                fps=fps, 
-                dpi=150
-            )
+            anim.save(output_name, writer="pillow", fps=fps, dpi=150)
         print(f"Successfully saved animation to {output_name}")
     except Exception as e:
         print(f"Error saving animation: {e}")
-        if writer == 'ffmpeg':
-            print("Tip: Try using writer='pillow' to save as GIF instead (no ffmpeg dependency)")
-    
+        if writer_backend == "ffmpeg":
+            print(
+                "Tip: Try using writer='pillow' to save as GIF instead (no ffmpeg dependency)"
+            )
+
     plt.close(fig)
 
 
@@ -841,12 +862,12 @@ def visualize_pbc_images(
 ):
     """
     Visualize polymer chains with Periodic Boundary Condition (PBC) periodic images.
-    
+
     This function renders the central polymer chain along with its periodic images
     across neighboring simulation boxes, providing a complete view of the system
     under PBC. Useful for verifying chain continuity across box boundaries and
     visualizing entanglement between periodic images.
-    
+
     MOTIVATION:
     1. PBC Continuity: Shows how polymer chains connect across periodic boundaries,
        essential for verifying simulation correctness.
@@ -856,54 +877,54 @@ def visualize_pbc_images(
        publication-quality figures with correct scale representation.
     4. Visual Hierarchy: Central chain is emphasized while periodic images are
        rendered with reduced alpha/size to maintain visual clarity.
-    
+
     PARAMETERS:
     -----------
     traj : Trajectory object
         The trajectory object containing coordinates, topology, and box vectors.
-        Must have attributes: topology, chain_info, box_vectors, and methods 
+        Must have attributes: topology, chain_info, box_vectors, and methods
         xyz()/xyz_wrapped().
-    
+
     select_frame : int, default=0
-        Frame index to visualize. Use different values to inspect different 
+        Frame index to visualize. Use different values to inspect different
         snapshots of the simulation.
-    
+
     n_layers : int, default=1
-        Number of periodic image layers in each direction. 
+        Number of periodic image layers in each direction.
         - n_layers=0: Central box only
         - n_layers=1: 3*3*3 = 27 boxes (central + 26 images)
         - n_layers=2: 5*5*5 = 125 boxes
         Higher values show more context but increase rendering time.
-    
+
     image_alpha : float, default=0.15
         Transparency (alpha) value for periodic image chains (0.0 to 1.0).
         Lower values make images more faint, emphasizing the central chain.
-    
+
     image_style : str, default='scatter'
         Rendering style for periodic images:
         - 'scatter': Show beads as points (emphasizes particle positions)
         - 'line': Show bonds as lines (emphasizes chain connectivity)
         - 'both': Show both beads and bonds equally
-    
+
     axis_limits : tuple or None, default=None
-        (x_min, x_max, y_min, y_max, z_min, z_max). If None, auto-calculated 
+        (x_min, x_max, y_min, y_max, z_min, z_max). If None, auto-calculated
         from all plotted points (central + images) with 55% buffer.
-    
+
     colors : list or None, default=None
         List of colors for each chain (used when color_mode='chain'). If None,
         uses matplotlib 'tab10' colormap cyclically.
-    
+
     output_name : str or None, default=None
         Output file path for saving the figure. Behavior:
-        - None: Displays figure interactively using plt.show() (suitable for 
+        - None: Displays figure interactively using plt.show() (suitable for
           Jupyter notebooks or interactive sessions).
         - str (e.g., 'pbc_vis.png'): Saves figure to file at 300 DPI and closes.
         Supported formats: .png, .pdf, .svg, .jpg, etc. (matplotlib backend dependent)
-    
+
     isring : bool, default=False
-        If True, adds a bond between the last and first bead of each chain 
+        If True, adds a bond between the last and first bead of each chain
         (circular/closed-loop topology).
-    
+
     r : float or None, default=None
         Physical bead radius in nm (or simulation length units). If provided:
         - Marker sizes are calculated based on figure DPI and data range
@@ -911,49 +932,49 @@ def visualize_pbc_images(
         - Periodic image beads use 40% of physical size (for visual hierarchy)
         - Projection type set to 'ortho' for accurate size representation
         If None, uses default marker sizes (central=20, images=10).
-    
+
     recenter : bool, default=True
-        If True, re-centers the system so the central chain's Center of Mass 
-        (COM) is at the origin. This keeps the molecule in focus regardless of 
+        If True, re-centers the system so the central chain's Center of Mass
+        (COM) is at the origin. This keeps the molecule in focus regardless of
         diffusion. Set to False to see absolute positions in the simulation box.
-    
+
     color_mode : str, default='chain'
         Coloring scheme for beads:
-        - 'chain': Each polymer chain has a distinct color (good for tracking 
+        - 'chain': Each polymer chain has a distinct color (good for tracking
           individual chains across PBC).
-        - 'type': Beads colored by their type/monomer species (requires 'types' 
+        - 'type': Beads colored by their type/monomer species (requires 'types'
           parameter or traj.chrom_seq/traj.types attribute).
-    
+
     types : array-like or None, default=None
-        Array of bead types (length = total beads). If None, attempts to use 
+        Array of bead types (length = total beads). If None, attempts to use
         traj.chrom_seq or traj.types. Only used when color_mode='type'.
-    
+
     wrap : bool, default=False
-        If True, uses traj.xyz_wrapped() to apply PBC wrapping to coordinates 
-        before visualization. If False, uses raw coordinates (may show chains 
+        If True, uses traj.xyz_wrapped() to apply PBC wrapping to coordinates
+        before visualization. If False, uses raw coordinates (may show chains
         extending outside the box).
-    
+
     RETURNS:
     --------
     None
         - If output_name is provided: Figure is saved to file.
         - If output_name is None: Figure is displayed interactively.
-    
+
     NOTES:
     ------
-    - Requires traj.box_vectors to be available. Function will exit with error 
+    - Requires traj.box_vectors to be available. Function will exit with error
       if box vectors are missing.
     - For n_layers > 1, rendering time increases cubically (3³=27, 5³=125 boxes).
       Use n_layers=1 for most cases; higher values only when needed.
-    - Physical sizing (r parameter) requires orthographic projection for accurate 
+    - Physical sizing (r parameter) requires orthographic projection for accurate
       representation. Perspective projection is used when r=None.
-    - Periodic image beads are rendered at 40% size of central beads to create 
+    - Periodic image beads are rendered at 40% size of central beads to create
       visual depth hierarchy.
-    - For publication figures, recommend: output_name='figure.pdf', dpi=300, 
+    - For publication figures, recommend: output_name='figure.pdf', dpi=300,
       r=<physical_radius>, image_alpha=0.1-0.2.
-    - If chains appear discontinuous across boundaries, try wrap=True or check 
+    - If chains appear discontinuous across boundaries, try wrap=True or check
       simulation PBC settings.
-    
+
     SEE ALSO:
     ---------
     visualize_animation : For creating time-series animations of polymer dynamics.

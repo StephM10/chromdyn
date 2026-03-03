@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 from multiprocessing import Pool, cpu_count
-from typing import Dict, Union, List, Optional
+from typing import Dict, Union, List, Optional, Tuple
 from pathlib import Path
 import numpy as np
 import h5py
@@ -147,10 +147,12 @@ class Analyzer:
         return results
 
     @staticmethod
-    def compute_RG(positions: np.ndarray, return_components: bool = False) -> Union[float, np.ndarray, Tuple]:
+    def compute_RG(
+        positions: np.ndarray, return_components: bool = False
+    ) -> Union[float, np.ndarray, Tuple]:
         """
         Calculates the Radius of Gyration (Rg).
-        
+
         Args:
             positions: Coordinates array of shape (N, 3) or (T, N, 3).
             return_components: If True, returns a tuple (rg_total, rg_xyz).
@@ -165,21 +167,21 @@ class Analyzer:
         if positions.ndim == 2:
             # 1. Calculate Center of Mass
             center_of_mass = np.mean(positions, axis=0)
-            
+
             # 2. Calculate squared deviations for each dimension (x, y, z) separately
             # Shape remains (N, 3) here
             sq_deviations = (positions - center_of_mass) ** 2
-            
+
             # 3. Mean over particles (N) to get squared Rg components
             # Shape becomes (3,) -> [Rgx^2, Rgy^2, Rgz^2]
             rg_sq_components = np.mean(sq_deviations, axis=0)
-            
+
             # 4. Calculate Total Rg
             # Rg = sqrt(Rgx^2 + Rgy^2 + Rgz^2)
             rg_total = float(np.sqrt(np.sum(rg_sq_components)))
 
             if return_components:
-                rg_xyz = np.sqrt(rg_sq_components) # Shape (3,)
+                rg_xyz = np.sqrt(rg_sq_components)  # Shape (3,)
                 return rg_total, rg_xyz
             else:
                 return rg_total
@@ -191,22 +193,22 @@ class Analyzer:
             # 1. Calculate Centers of Mass
             # Shape (T, 3)
             centers_of_mass = np.mean(positions, axis=1)
-            
+
             # 2. Calculate squared deviations
             # Use broadcasting: (T, N, 3) - (T, 1, 3)
             sq_deviations = (positions - centers_of_mass[:, None, :]) ** 2
-            
+
             # 3. Mean over particles (axis 1) to get squared Rg components
             # Shape becomes (T, 3)
             rg_sq_components = np.mean(sq_deviations, axis=1)
-            
+
             # 4. Calculate Total Rg per frame
             # Sum over xyz (axis 1 of the component array), then sqrt
             # Shape (T,)
             rg_total = np.sqrt(np.sum(rg_sq_components, axis=1))
 
             if return_components:
-                rg_xyz = np.sqrt(rg_sq_components) # Shape (T, 3)
+                rg_xyz = np.sqrt(rg_sq_components)  # Shape (T, 3)
                 return rg_total, rg_xyz
             else:
                 return rg_total
@@ -220,11 +222,11 @@ class Analyzer:
     def wrap_coordinates(positions: np.ndarray, box_vectors: np.ndarray) -> np.ndarray:
         """
         Convert Unwrapped coordinates to Wrapped coordinates (inside the box).
-        
+
         Args:
             positions: (..., 3) array
             box_vectors: (3, 3) array or (3,) array of box lengths
-            
+
         Returns:
             positions_wrapped: Coordinates within [0, box_length]
         """
@@ -233,7 +235,7 @@ class Analyzer:
             box_diag = np.diag(box_vectors)
         else:
             box_diag = np.array(box_vectors)
-            
+
         # Modulo operation handles the wrapping
         # positions % box_diag ensures result is in [0, L)
         return positions % box_diag
@@ -688,16 +690,16 @@ class Analyzer:
         """
         M, B_total, D = coords.shape
         msd_result = np.zeros((M, B_total), dtype=np.float32)
-        
+
         # Pre-calculate denominator, shape (M, 1)
         den = (M - np.arange(M, dtype=np.float32))[:, None]
-        
+
         for start_idx in range(0, B_total, batch_size):
             end_idx = min(start_idx + batch_size, B_total)
             # Convert to single-precision floating point to save memory and speed up
             r_batch = coords[:, start_idx:end_idx, :].astype(np.float32)
             B_current = r_batch.shape[1]
-            
+
             # --- Step 1: Cross Term S2 (Autocorrelation) ---
             S2 = np.zeros((M, B_current), dtype=np.float32)
             for dim in range(D):
@@ -707,18 +709,18 @@ class Analyzer:
                 power_spectrum = F.real**2 + F.imag**2
                 corr = np.fft.irfft(power_spectrum, n=2 * M, axis=0)[:M, :]
                 S2 += corr / den
-                
+
             # --- Step 2: Sum of Squares Term S1 (Prefix Sum Optimization) ---
             D_sq = np.sum(r_batch**2, axis=2)
             Q_0 = 2.0 * np.sum(D_sq, axis=0)
-            
-            sub_terms = D_sq[:-1, :] + D_sq[M-1:0:-1, :]
+
+            sub_terms = D_sq[:-1, :] + D_sq[M - 1 : 0 : -1, :]
             cum_sub = np.cumsum(sub_terms, axis=0)
-            
+
             zero_pad = np.zeros((1, B_current), dtype=np.float32)
             Q_m = Q_0 - np.concatenate((zero_pad, cum_sub), axis=0)
             S1 = Q_m / den
-            
+
             # --- Step 3: Combine Results ---
             msd_result[:, start_idx:end_idx] = S1 - 2.0 * S2
 
@@ -733,54 +735,66 @@ class Analyzer:
         M, B_total, D = coords.shape
         msd_result = np.zeros((M, B_total), dtype=np.float32)
         den_gpu = cp.asarray((M - np.arange(M, dtype=np.float32))[:, None])
-        
+
         for start_idx in range(0, B_total, batch_size):
             end_idx = min(start_idx + batch_size, B_total)
             r_gpu = cp.asarray(coords[:, start_idx:end_idx, :], dtype=cp.float32)
             B_current = r_gpu.shape[1]
-            
+
             S2 = cp.zeros((M, B_current), dtype=cp.float32)
             for dim in range(D):
-                r_1d = r_gpu[:, :, dim] 
+                r_1d = r_gpu[:, :, dim]
                 F = cp.fft.rfft(r_1d, n=2 * M, axis=0)
                 power_spectrum = F.real**2 + F.imag**2
                 corr = cp.fft.irfft(power_spectrum, n=2 * M, axis=0)[:M, :]
                 S2 += corr / den_gpu
-                
+
             D_sq = cp.sum(r_gpu**2, axis=2)
             Q_0 = 2.0 * cp.sum(D_sq, axis=0)
-            
-            sub_terms = D_sq[:-1, :] + D_sq[M-1:0:-1, :]
+
+            sub_terms = D_sq[:-1, :] + D_sq[M - 1 : 0 : -1, :]
             cum_sub = cp.cumsum(sub_terms, axis=0)
-            
+
             zero_pad = cp.zeros((1, B_current), dtype=cp.float32)
             Q_m = Q_0 - cp.concatenate((zero_pad, cum_sub), axis=0)
             S1 = Q_m / den_gpu
-            
+
             msd_batch = S1 - 2.0 * S2
             msd_result[:, start_idx:end_idx] = cp.asnumpy(msd_batch)
-            
+
             # Free up memory
-            del r_gpu, S2, F, power_spectrum, corr, D_sq, sub_terms, cum_sub, Q_m, S1, msd_batch
+            del (
+                r_gpu,
+                S2,
+                F,
+                power_spectrum,
+                corr,
+                D_sq,
+                sub_terms,
+                cum_sub,
+                Q_m,
+                S1,
+                msd_batch,
+            )
             cp.get_default_memory_pool().free_all_blocks()
 
         return msd_result
 
     @staticmethod
     def compute_msd(
-        positions: np.ndarray, 
-        batch_size: int = 1000, 
-        platform: str = 'auto',
-        sampling_step: int = 1
+        positions: np.ndarray,
+        batch_size: int = 1000,
+        platform: str = "auto",
+        sampling_step: int = 1,
     ) -> np.ndarray:
         """
         Computes the Mean-Squared Displacement (MSD) for a trajectory.
-        
+
         Args:
             positions (np.ndarray): Array of coordinates with shape (n_frames, n_beads, 3).
             batch_size (int): Number of beads to process per batch. Balances RAM/VRAM usage.
             platform (str): 'auto', 'cpu', or 'gpu'. If 'auto', uses GPU if available.
-            
+
         Returns:
             np.ndarray: Computed MSD array of shape (n_frames, n_beads).
         """
@@ -788,26 +802,30 @@ class Analyzer:
         if not isinstance(positions, np.ndarray):
             raise TypeError("Input positions must be a numpy.ndarray.")
         if positions.ndim != 3 or positions.shape[2] != 3:
-            raise ValueError(f"Expected positions shape (n_frames, n_beads, 3), got {positions.shape}")
-            
+            raise ValueError(
+                f"Expected positions shape (n_frames, n_beads, 3), got {positions.shape}"
+            )
+
         platform = platform.lower()
-        if platform not in ['auto', 'cpu', 'gpu']:
+        if platform not in ["auto", "cpu", "gpu"]:
             raise ValueError("Platform must be 'auto', 'cpu', or 'gpu'.")
         if not isinstance(sampling_step, int) or sampling_step < 1:
             raise ValueError("sampling_step must be a positive integer.")
 
         # 2. Platform Routing Logic
         use_gpu = False
-        if platform == 'gpu':
+        if platform == "gpu":
             if CUPY_AVAILABLE:
                 use_gpu = True
             else:
-                warnings.warn("GPU requested but CuPy is not available. Falling back to CPU.")
-        elif platform == 'auto':
+                warnings.warn(
+                    "GPU requested but CuPy is not available. Falling back to CPU."
+                )
+        elif platform == "auto":
             use_gpu = CUPY_AVAILABLE
 
         positions = positions[::sampling_step, :, :]
-        
+
         # 3. Execution
         if use_gpu:
             print(f"Computing MSD on GPU (Batch size: {batch_size})...")
@@ -815,68 +833,67 @@ class Analyzer:
         else:
             print(f"Computing MSD on CPU (Batch size: {batch_size})...")
             return Analyzer._msd_fft_cpu_batch(positions, batch_size)
+
     @staticmethod
     def compute_anomalous_dynamics(
-            lag_times: np.ndarray, 
-            msd: np.ndarray
-        ) -> Tuple[np.ndarray, np.ndarray]:
-            """
-            Computes the anomalous exponent alpha(t) and apparent diffusivity D_app(t)
-            simultaneously. Fully vectorized to support both 1D and 2D MSD arrays.
-            
-            Motivation: 
-            1. Slicing [1:] safely bypasses the t=0 singularity without breaking 2D shapes.
-            2. Calculating alpha and D_app together avoids redundant log/gradient operations.
-            
-            Args:
-                lag_times (np.ndarray): 1D array of time lags, shape (M,).
-                msd (np.ndarray): 1D array (M,) or 2D array (M, B) of Mean Squared Displacements.
-                
-            Returns:
-                alpha (np.ndarray): Exponent alpha(t), same shape as msd.
-                D_app (np.ndarray): Apparent diffusivity D_app(t), same shape as msd.
-            """
-            # 1. Validation & Shape Consistency
-            if lag_times.ndim != 1:
-                raise ValueError("lag_times must be a 1D array.")
-            if msd.shape[0] != lag_times.shape[0]:
-                raise ValueError(f"Time axis mismatch: lag_times {lag_times.shape}, msd {msd.shape}")
+        lag_times: np.ndarray, msd: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Computes the anomalous exponent alpha(t) and apparent diffusivity D_app(t)
+        simultaneously. Fully vectorized to support both 1D and 2D MSD arrays.
 
-            # Initialize full arrays with NaNs (t=0 will remain NaN)
-            alpha_full = np.full_like(msd, np.nan, dtype=np.float64)
-            D_app_full = np.full_like(msd, np.nan, dtype=np.float64)
+        Motivation:
+        1. Slicing [1:] safely bypasses the t=0 singularity without breaking 2D shapes.
+        2. Calculating alpha and D_app together avoids redundant log/gradient operations.
 
-            # 2. Slice off t=0 to avoid log(0) = -inf
-            t_valid = lag_times[1:]
-            msd_valid = msd[1:]
+        Args:
+            lag_times (np.ndarray): 1D array of time lags, shape (M,).
+            msd (np.ndarray): 1D array (M,) or 2D array (M, B) of Mean Squared Displacements.
 
-            # Suppress warnings for any zero or negative values in specific beads
-            with np.errstate(divide='ignore', invalid='ignore'):
-                log_t = np.log(t_valid)
-                log_msd = np.log(msd_valid)
+        Returns:
+            alpha (np.ndarray): Exponent alpha(t), same shape as msd.
+            D_app (np.ndarray): Apparent diffusivity D_app(t), same shape as msd.
+        """
+        # 1. Validation & Shape Consistency
+        if lag_times.ndim != 1:
+            raise ValueError("lag_times must be a 1D array.")
+        if msd.shape[0] != lag_times.shape[0]:
+            raise ValueError(
+                f"Time axis mismatch: lag_times {lag_times.shape}, msd {msd.shape}"
+            )
 
-            # 3. Calculate alpha(t) via gradient
-            # Motivation: np.gradient accurately computes the derivative on irregularly 
-            # spaced grids (like log_t) along the time axis (axis=0).
-            alpha_valid = np.gradient(log_msd, log_t, axis=0)
+        # Initialize full arrays with NaNs (t=0 will remain NaN)
+        alpha_full = np.full_like(msd, np.nan, dtype=np.float64)
+        D_app_full = np.full_like(msd, np.nan, dtype=np.float64)
 
-            # 4. Calculate D_app(t)
-            # Motivation: Reshape t_valid for broadcasting if msd is a 2D matrix (M, B)
-            if msd.ndim == 2:
-                t_bcast = t_valid[:, np.newaxis]
-            else:
-                t_bcast = t_valid
+        # 2. Slice off t=0 to avoid log(0) = -inf
+        t_valid = lag_times[1:]
+        msd_valid = msd[1:]
 
-            D_app_valid = msd_valid / (t_bcast ** alpha_valid)
+        # Suppress warnings for any zero or negative values in specific beads
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_t = np.log(t_valid)
+            log_msd = np.log(msd_valid)
 
-            # 5. Populate the full arrays (leaving index 0 as NaN)
-            alpha_full[1:] = alpha_valid
-            D_app_full[1:] = D_app_valid
+        # 3. Calculate alpha(t) via gradient
+        # Motivation: np.gradient accurately computes the derivative on irregularly
+        # spaced grids (like log_t) along the time axis (axis=0).
+        alpha_valid = np.gradient(log_msd, log_t, axis=0)
 
-            return alpha_full, D_app_full
+        # 4. Calculate D_app(t)
+        # Motivation: Reshape t_valid for broadcasting if msd is a 2D matrix (M, B)
+        if msd.ndim == 2:
+            t_bcast = t_valid[:, np.newaxis]
+        else:
+            t_bcast = t_valid
 
+        D_app_valid = msd_valid / (t_bcast**alpha_valid)
 
-        
+        # 5. Populate the full arrays (leaving index 0 as NaN)
+        alpha_full[1:] = alpha_valid
+        D_app_full[1:] = D_app_valid
+
+        return alpha_full, D_app_full
 
 
 class TrajectoryLoader:
@@ -1149,16 +1166,18 @@ class Trajectory:
 
         # 3. Calculate 'general' Rg (all beads)
         # Forward the get_components flag to the static method
-        results["general"] = Analyzer.compute_RG(all_positions, return_components=get_components)
+        results["general"] = Analyzer.compute_RG(
+            all_positions, return_components=get_components
+        )
 
-        # 4. Check if system is Heterogeneous (异质系统)
+        # 4. Check if system is Heterogeneous
         unique_types = np.unique(bead_types)
 
         # If type count is greater than 1, calculate by type
         if len(unique_types) > 1:
             for t_type in unique_types:
-                # Create Boolean Mask (布尔掩码)
-                mask = (bead_types == t_type)
+                # Create Boolean Mask
+                mask = bead_types == t_type
 
                 # Slice positions: [all frames, filtered beads, xyz]
                 subset_positions = all_positions[:, mask, :]
@@ -1168,18 +1187,19 @@ class Trajectory:
 
                 # 5. Calculate Rg for this type
                 # The return type of Analyzer.compute_RG depends on get_components
-                rg_data = Analyzer.compute_RG(subset_positions, return_components=get_components)
-                
+                rg_data = Analyzer.compute_RG(
+                    subset_positions, return_components=get_components
+                )
+
                 # If get_components is True, rg_data is a tuple (total, xyz)
                 # We can store it as a sub-dictionary for better readability
                 if get_components:
                     total_rg, xyz_rg = rg_data
-                    results[key_name] = {
-                        "total": total_rg,
-                        "components": xyz_rg
-                    }
+                    results[key_name] = {"total": total_rg, "components": xyz_rg}
                     # Also update "general" to a dict format for structure consistency
-                    if key_name == str(unique_types[0]): # Only need to format "general" once
+                    if key_name == str(
+                        unique_types[0]
+                    ):  # Only need to format "general" once
                         gen_total, gen_xyz = results["general"]
                         results["general"] = {"total": gen_total, "components": gen_xyz}
                 else:
@@ -1190,10 +1210,10 @@ class Trajectory:
     def xyz_wrapped(self, frames=[0, None, 1], bead_selection=None, xyz_cols=[0, 1, 2]):
         """
         Get the *WRAPPED* coordinates (inside the simulation box) for selected beads.
-        
-        This acts as a wrapper around self.xyz() but applies the periodic wrapping 
+
+        This acts as a wrapper around self.xyz() but applies the periodic wrapping
         operation using self.box_vectors.
-        
+
         Args:
             frames (list): [start, end, step]
             bead_selection (list/array): Indices of beads to retrieve.
@@ -1204,8 +1224,10 @@ class Trajectory:
         """
         # 1. Get raw Unwrapped coordinates (T, N, 3)
         # Directly reuse existing xyz function
-        coords_unwrapped = self.xyz(frames=frames, bead_selection=bead_selection, xyz_cols=xyz_cols)
-        
+        coords_unwrapped = self.xyz(
+            frames=frames, bead_selection=bead_selection, xyz_cols=xyz_cols
+        )
+
         # 2. Get and process Box Vectors
         if self.box_vectors is None:
             # If no box information is found, cannot wrap. Return raw coordinates or raise error.
@@ -1217,29 +1239,29 @@ class Trajectory:
         start, end, step = frames
         if end is None:
             end = self.n_frames
-        
+
         # Range check - maintain consistency with xyz function logic
         start = max(0, start)
         end = min(end, self.n_frames)
-        
+
         # Slice box data (T_subset, 3, 3)
         # Note: Assumes box_vectors is a numpy array of shape (Total_Frames, 3, 3)
         subset_boxes = self.box_vectors[start:end:step]
-        
+
         # 3. Perform Wrapping operation
         # Extract box diagonal lengths (Lx, Ly, Lz)
         # Shape transformation: (T, 3, 3) -> (T, 3)
         box_diag = np.diagonal(subset_boxes, axis1=1, axis2=2)
-        
+
         # To utilize Broadcasting, reshape box_diag to (T, 1, 3)
         # coords_unwrapped: (T, N, 3)
         # box_diag_reshaped: (T, 1, 3)
         box_diag_reshaped = box_diag[:, np.newaxis, :]
-        
+
         # Perform wrap using modulo operator
         # math: coords_wrapped = coords % box
         coords_wrapped = coords_unwrapped % box_diag_reshaped
-        
+
         return coords_wrapped
 
     def check_if_wrapped(self):
@@ -1259,15 +1281,14 @@ class Trajectory:
 
         # Assume normal bond length is around 1.0. Large values indicate the trajectory is wrapped.
         if np.max(dists) > 10.0:  # Threshold set to, e.g., 10 times the bond length
-            print("Warning: Extremely large bond distance detected! Data appears to be Wrapped.")
+            print(
+                "Warning: Extremely large bond distance detected! Data appears to be Wrapped."
+            )
             print("Direct Rg calculation will be incorrect! Must Unwrap first.")
         else:
             print(
                 "Max bond distance is normal. Data appears to be Unwrapped (continuous) or the system has not crossed boundaries."
             )
-
-
-        
 
 
 # --- External Wrappers (For Backward Compatibility / Functional Style) ---
