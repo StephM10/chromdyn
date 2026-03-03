@@ -815,6 +815,68 @@ class Analyzer:
         else:
             print(f"Computing MSD on CPU (Batch size: {batch_size})...")
             return Analyzer._msd_fft_cpu_batch(positions, batch_size)
+    @staticmethod
+    def compute_anomalous_dynamics(
+            lag_times: np.ndarray, 
+            msd: np.ndarray
+        ) -> Tuple[np.ndarray, np.ndarray]:
+            """
+            Computes the anomalous exponent alpha(t) and apparent diffusivity D_app(t)
+            simultaneously. Fully vectorized to support both 1D and 2D MSD arrays.
+            
+            Motivation: 
+            1. Slicing [1:] safely bypasses the t=0 singularity without breaking 2D shapes.
+            2. Calculating alpha and D_app together avoids redundant log/gradient operations.
+            
+            Args:
+                lag_times (np.ndarray): 1D array of time lags, shape (M,).
+                msd (np.ndarray): 1D array (M,) or 2D array (M, B) of Mean Squared Displacements.
+                
+            Returns:
+                alpha (np.ndarray): Exponent alpha(t), same shape as msd.
+                D_app (np.ndarray): Apparent diffusivity D_app(t), same shape as msd.
+            """
+            # 1. Validation & Shape Consistency
+            if lag_times.ndim != 1:
+                raise ValueError("lag_times must be a 1D array.")
+            if msd.shape[0] != lag_times.shape[0]:
+                raise ValueError(f"Time axis mismatch: lag_times {lag_times.shape}, msd {msd.shape}")
+
+            # Initialize full arrays with NaNs (t=0 will remain NaN)
+            alpha_full = np.full_like(msd, np.nan, dtype=np.float64)
+            D_app_full = np.full_like(msd, np.nan, dtype=np.float64)
+
+            # 2. Slice off t=0 to avoid log(0) = -inf
+            t_valid = lag_times[1:]
+            msd_valid = msd[1:]
+
+            # Suppress warnings for any zero or negative values in specific beads
+            with np.errstate(divide='ignore', invalid='ignore'):
+                log_t = np.log(t_valid)
+                log_msd = np.log(msd_valid)
+
+            # 3. Calculate alpha(t) via gradient
+            # Motivation: np.gradient accurately computes the derivative on irregularly 
+            # spaced grids (like log_t) along the time axis (axis=0).
+            alpha_valid = np.gradient(log_msd, log_t, axis=0)
+
+            # 4. Calculate D_app(t)
+            # Motivation: Reshape t_valid for broadcasting if msd is a 2D matrix (M, B)
+            if msd.ndim == 2:
+                t_bcast = t_valid[:, np.newaxis]
+            else:
+                t_bcast = t_valid
+
+            D_app_valid = msd_valid / (t_bcast ** alpha_valid)
+
+            # 5. Populate the full arrays (leaving index 0 as NaN)
+            alpha_full[1:] = alpha_valid
+            D_app_full[1:] = D_app_valid
+
+            return alpha_full, D_app_full
+
+
+        
 
 
 class TrajectoryLoader:

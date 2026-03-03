@@ -14,6 +14,7 @@ from .utilities import LogManager
 # Integrator Manager: Creates integrators for Brownian or Langevin dynamics
 # -------------------------------------------------------------------
 class IntegratorManager:
+    # Note: for langevin cases, the friction is actually the friction_phys / mass
     VALID_INTEGRATORS = [
         "langevin",
         "brownian",
