@@ -16,6 +16,8 @@ import os
 import openmm.unit as unit
 from openmm.app import Topology, Element
 import warnings
+from collections import defaultdict
+from itertools import combinations_with_replacement
 
 
 # for GPU acceleration
@@ -895,6 +897,196 @@ class Analyzer:
 
         return alpha_full, D_app_full
 
+    @staticmethod
+    def collect_distances_from_center_unified(
+            coords_trajectory: np.ndarray,
+            bead_types: np.ndarray,
+            sampling_rate: int = 1,
+            batch_size: int = 1000,
+            device: str = 'cpu',
+            center: np.ndarray = None,
+        ) -> Dict[str, np.ndarray]:
+        R"""
+        Unified version for collecting distances from a specified fixed center with batching support.
+        
+        Changes from COM version:
+        - Calculates distance from a fixed coordinate (default: origin) instead of Center of Mass.
+        - Removed bead_masses argument.
+        
+        Args:
+            coords_trajectory: (n_frames, n_beads, 3) array of coordinates.
+            bead_types: (n_beads,) array of bead types.
+            sampling_rate: Interval for frame sampling.
+            batch_size: Number of frames to process per batch.
+            device: 'cpu' or 'gpu'.
+            center: (n_dims,) array specifying the center coordinate. Defaults to origin.
+            
+        Returns:
+            Dict mapping bead_type -> flattened array of distances.
+        """
+        # --- 1. Preparation ---
+        coords_sliced = coords_trajectory[::sampling_rate]
+        
+        # Validate shape and get dimensions
+        if coords_sliced.ndim != 3:
+            raise ValueError(f"coords_trajectory must be 3D (frames, beads, dims), got {coords_sliced.ndim}D")
+        
+        n_frames, n_beads, n_dims = coords_sliced.shape
+        
+        # Select backend
+        xp = cp if device.lower() == 'gpu' and CUPY_AVAILABLE else np
+
+        # Handle Center Coordinate
+        if center is None:
+            center = np.zeros(n_dims)
+        else:
+            center = np.asarray(center)
+            # Ensure center matches the spatial dimension of the trajectory
+            if center.shape[-1] != n_dims:
+                raise ValueError(
+                    f"Center dimension ({center.shape[-1]}) does not match "
+                    f"trajectory spatial dimension ({n_dims})"
+                )
+        
+        # Move center to correct device (cpu/gpu)
+        center_xp = xp.asarray(center, dtype=coords_sliced.dtype)
+        
+        # Prepare bead type indices (always on CPU for dictionary keys)
+        bead_types = np.asarray(bead_types)
+        if bead_types.shape[0] != coords_sliced.shape[1]:
+            raise ValueError(f"bead_types length ({bead_types.shape[0]}) must match "
+                        f"number of beads in trajectory ({coords_sliced.shape[1]})")
+
+        unique_types = np.unique(bead_types)
+        type_indices = {t: np.where(bead_types == t)[0] for t in unique_types}
+        
+        # accumulator
+        distances_by_type_accumulator = defaultdict(list)
+
+        print(f"Starting {device.upper()} analysis (Fixed Center) with batch_size={batch_size}...")
+        print(f"Center coordinate: {center} (dims={n_dims})")
+
+        # --- 2. Batch Processing Loop ---
+        for start in range(0, n_frames, batch_size):
+            end = min(start + batch_size, n_frames)
+            
+            # Load batch to device
+            batch_coords = xp.asarray(coords_sliced[start:end])
+
+            # A. Relative Coordinates using broadcasting
+            # batch_coords shape: (batch_size, n_beads, n_dims)
+            # center_xp shape: (n_dims,)
+            # Result shape: (batch_size, n_beads, n_dims)
+            centered_batch = batch_coords - center_xp
+
+            # B. L2 Norm along the last axis (spatial dimension)
+            # result shape: (batch_size, n_beads)
+            dist_batch = xp.linalg.norm(centered_batch, axis=-1)
+
+            # C. Collect data
+            for btype, indices in type_indices.items():
+                # Select distances for specific bead types and flatten
+                selected_dist = dist_batch[:, indices].ravel()
+                
+                if device.lower() == 'gpu':
+                    distances_by_type_accumulator[btype].append(cp.asnumpy(selected_dist))
+                else:
+                    distances_by_type_accumulator[btype].append(selected_dist)
+
+            # VRAM management for GPU
+            if device.lower() == 'gpu':
+                del batch_coords, centered_batch, dist_batch
+                cp.get_default_memory_pool().free_all_blocks()
+
+        # --- 3. Final Consolidation ---
+        final_distributions = {}
+        for btype, list_of_arrays in distances_by_type_accumulator.items():
+            final_distributions[btype] = np.concatenate(list_of_arrays)
+
+        return final_distributions
+
+    @staticmethod
+    def collect_distances_from_com_unified(
+        coords_trajectory: np.ndarray,
+        bead_types: np.ndarray,
+        bead_masses: Optional[np.ndarray] = None,
+        sampling_rate: int = 1,
+        batch_size: int = 1000,
+        device: str = 'cpu'
+    ) -> Dict[str, np.ndarray]:
+        R"""
+        Unified version for collecting distances from COM with batching support for CPU/GPU.
+        """
+        # --- 1. Preparation ---
+        coords_sliced = coords_trajectory[::sampling_rate]
+        if coords_sliced.size == 0:
+            raise ValueError(f"coords_trajectory is empty after slicing with sampling_rate={sampling_rate}")
+
+        n_frames, n_beads, _ = coords_sliced.shape
+        xp = cp if device.lower() == 'gpu' and CUPY_AVAILABLE else np # auto-switch
+
+        if len(bead_types) != n_beads:
+            raise ValueError(
+                f"Dimension mismatch: bead_types length ({len(bead_types)}) "
+                f"does not match trajectory n_beads ({n_beads})"
+            )
+
+        if bead_masses is None:
+            masses = xp.ones(n_beads)
+        else:
+            masses = xp.asarray(bead_masses)
+
+        bead_types = np.asarray(bead_types)
+        if bead_types.shape[0] != coords_sliced.shape[1]:
+            raise ValueError(f"bead_types length ({bead_types.shape[0]}) must match "
+                        f"number of beads in trajectory ({coords_sliced.shape[1]})")
+
+        unique_types = np.unique(bead_types)
+        type_indices = {t: np.where(bead_types == t)[0] for t in unique_types}
+        
+        # accumulator
+        distances_by_type_accumulator = defaultdict(list)
+
+        print(f"Starting {device.upper()} analysis with batch_size={batch_size}...")
+
+        # --- 2. Batch Processing Loop ---
+        for start in range(0, n_frames, batch_size):
+            end = min(start + batch_size, n_frames)
+            # load batch to device
+            batch_coords = xp.asarray(coords_sliced[start:end])
+
+            # A. Calculate COM for each batch
+            # result shape: (batch_size, 3)
+            com_batch = xp.average(batch_coords, axis=1, weights=masses)
+
+            # B. Relative Coordinates using broadcasting
+            # Motivation: com_batch[:, None, :] using broadcasting: (N, 3) -> (N, 1, 3)
+            centered_batch = batch_coords - com_batch[:, xp.newaxis, :]
+
+            # C. L2 Norm
+            # result shape: (batch_size, n_beads)
+            dist_batch = xp.linalg.norm(centered_batch, axis=2)
+
+            # D. collect data
+            for btype, indices in type_indices.items():
+                selected_dist = dist_batch[:, indices].ravel()
+                if device.lower() == 'gpu':
+                    distances_by_type_accumulator[btype].append(cp.asnumpy(selected_dist))
+                else:
+                    distances_by_type_accumulator[btype].append(selected_dist)
+
+            # VRAM management
+            if device.lower() == 'gpu':
+                del batch_coords, com_batch, centered_batch, dist_batch
+                cp.get_default_memory_pool().free_all_blocks()
+
+        # --- 3. Final Consolidation ---
+        final_distributions = {}
+        for btype, list_of_arrays in distances_by_type_accumulator.items():
+            final_distributions[btype] = np.concatenate(list_of_arrays)
+
+        return final_distributions
+
 
 class TrajectoryLoader:
     """
@@ -1289,6 +1481,169 @@ class Trajectory:
             print(
                 "Max bond distance is normal. Data appears to be Unwrapped (continuous) or the system has not crossed boundaries."
             )
+
+    def get_distance_distribution_by_separation_and_type(
+        self, 
+        s: int = 1, 
+        bead_types: Optional[np.ndarray] = None,
+        start_frame: int = 0, 
+        end_frame: Optional[int] = None, 
+        sampling_step: int = 1,
+        batch_size: int = 1000,
+        wrapped: bool = False,
+        device: str = 'gpu'  
+    ) -> Dict[str, np.ndarray]:
+        """
+        Unified dispatcher for calculating spatial distances by separation and type.
+        Routes the computation to either CPU or GPU backend.
+        """
+        
+        # --- 1. Data Loading & Wrapped Routing ---
+        # IO part
+        if wrapped:
+            xyz = self.xyz_wrapped(frames=[start_frame, end_frame, sampling_step])
+        else:
+            xyz = self.xyz(frames=[start_frame, end_frame, sampling_step])
+
+        # --- 2. Basic Parsing & Validation ---
+        if bead_types is None:
+            bead_types = np.asarray(self.chrom_seq)
+
+        if bead_types.dtype.kind == 'S':
+            bead_types = np.char.decode(bead_types, 'utf-8')
+
+        n_frames_total, n_particles, _ = xyz.shape
+
+        if bead_types.shape[0] != n_particles:
+            raise ValueError("The length of bead_types must match the number of particles in xyz.")
+        
+        if not (0 < s < n_particles):
+            raise ValueError(f"Separation s must be between 1 and {n_particles-1}.")
+
+        # Handle frame slicing logic
+        if end_frame is None:
+            end_frame = n_frames_total
+            
+        frames_to_process = list(range(start_frame, end_frame, sampling_step))
+        if len(frames_to_process) == 0:
+            return {}
+            
+        # slice the xyz data
+        xyz_sliced = xyz[frames_to_process]
+
+        # --- 3. Device Dispatch ---
+        if device.lower() == 'gpu':
+            if CUPY_AVAILABLE:
+                print(f"Routing to GPU backend... (Wrapped: {wrapped})")
+                return self._calc_distances_gpu_worker(xyz_sliced, bead_types, s, batch_size)
+            else:
+                print("CuPy not available. Calculation will be performed on CPU.")
+                print(f"Routing to CPU backend... (Wrapped: {wrapped})")
+                return self._calc_distances_cpu_worker(xyz_sliced, bead_types, s, batch_size)
+        elif device.lower() == 'cpu':
+            print(f"Routing to CPU backend... (Wrapped: {wrapped})")
+            return self._calc_distances_cpu_worker(xyz_sliced, bead_types, s, batch_size)
+        else:
+            raise ValueError(f"Unsupported device: '{device}'. Please choose 'cpu' or 'gpu'.")
+
+    # ==========================================
+    # Private workers
+    # ==========================================
+
+    def _calc_distances_cpu_worker(
+        self, xyz_sliced: np.ndarray, bead_types: np.ndarray, s: int, batch_size: int
+    ) -> Dict[str, np.ndarray]:
+        """
+        Private worker for CPU batch processing. 
+        Assumes xyz_sliced and bead_types are pre-validated.
+        """
+        unique_types = np.unique(bead_types)
+        type_to_int_map = {t: i for i, t in enumerate(unique_types)}
+        int_to_type_map = {i: t for i, t in enumerate(unique_types)} 
+
+        integer_bead_types = np.array([type_to_int_map[t] for t in bead_types], dtype=np.int32)
+        unique_type_ints = np.arange(len(unique_types))
+        type_int_pairs = list(combinations_with_replacement(unique_type_ints, 2))
+        
+        types_i = integer_bead_types[:-s]
+        types_j = integer_bead_types[s:]
+        
+        valid_pair_masks = {}
+        for type_int1, type_int2 in type_int_pairs:
+            mask = (types_i == type_int1) & (types_j == type_int2) if type_int1 == type_int2 else \
+                   ((types_i == type_int1) & (types_j == type_int2)) | ((types_i == type_int2) & (types_j == type_int1))
+            if np.any(mask):
+                valid_pair_masks[(type_int1, type_int2)] = mask
+
+        frame_count = xyz_sliced.shape[0]
+        batched_results = defaultdict(list)
+
+        for batch_start in range(0, frame_count, batch_size):
+            batch_end = min(batch_start + batch_size, frame_count)
+            batch_coords = xyz_sliced[batch_start:batch_end]
+            
+            diffs = batch_coords[:, s:, :] - batch_coords[:, :-s, :]
+            off_diagonal_distances = np.linalg.norm(diffs, axis=2)
+            
+            for (type_int1, type_int2), mask in valid_pair_masks.items():
+                selected_distances = off_diagonal_distances[:, mask].ravel()
+                batched_results[(type_int1, type_int2)].append(selected_distances)
+
+        final_results = {}
+        for (type_int1, type_int2), list_of_arrays in batched_results.items():
+            final_results[f"{int_to_type_map[type_int1]}-{int_to_type_map[type_int2]}"] = np.concatenate(list_of_arrays)
+            
+        return final_results
+
+    def _calc_distances_gpu_worker(
+        self, xyz_sliced: np.ndarray, bead_types: np.ndarray, s: int, batch_size: int
+    ) -> Dict[str, np.ndarray]:
+        """
+        Private worker for GPU batch processing. 
+        Assumes xyz_sliced and bead_types are pre-validated.
+        """
+        unique_types = np.unique(bead_types)
+        type_to_int_map = {t: i for i, t in enumerate(unique_types)}
+        int_to_type_map = {i: t for i, t in enumerate(unique_types)} 
+
+        integer_bead_types = np.array([type_to_int_map[t] for t in bead_types], dtype=np.int32)
+        unique_type_ints = np.arange(len(unique_types))
+        type_int_pairs = list(combinations_with_replacement(unique_type_ints, 2))
+        
+        bead_types_cp = cp.array(integer_bead_types)
+        types_i = bead_types_cp[:-s]
+        types_j = bead_types_cp[s:]
+        
+        valid_pair_masks_cp = {}
+        for type_int1, type_int2 in type_int_pairs:
+            mask = (types_i == type_int1) & (types_j == type_int2) if type_int1 == type_int2 else \
+                   ((types_i == type_int1) & (types_j == type_int2)) | ((types_i == type_int2) & (types_j == type_int1))
+            if cp.any(mask):
+                valid_pair_masks_cp[(type_int1, type_int2)] = mask
+
+        frame_count = xyz_sliced.shape[0]
+        batched_results_cpu = defaultdict(list)
+
+        for batch_start in range(0, frame_count, batch_size):
+            batch_end = min(batch_start + batch_size, frame_count)
+            batch_coords_cp = cp.array(xyz_sliced[batch_start:batch_end])
+            
+            diffs_cp = batch_coords_cp[:, s:, :] - batch_coords_cp[:, :-s, :]
+            off_diagonal_distances_cp = cp.linalg.norm(diffs_cp, axis=2)
+            
+            for (type_int1, type_int2), mask_cp in valid_pair_masks_cp.items():
+                selected_distances_cp = off_diagonal_distances_cp[:, mask_cp].ravel()
+                batched_results_cpu[(type_int1, type_int2)].append(cp.asnumpy(selected_distances_cp))
+            
+            del batch_coords_cp, diffs_cp, off_diagonal_distances_cp, selected_distances_cp
+            cp.get_default_memory_pool().free_all_blocks()
+
+        final_results = {}
+        for (type_int1, type_int2), list_of_arrays in batched_results_cpu.items():
+            final_results[f"{int_to_type_map[type_int1]}-{int_to_type_map[type_int2]}"] = np.concatenate(list_of_arrays)
+            
+        return final_results
+
 
 
 # --- External Wrappers (For Backward Compatibility / Functional Style) ---
