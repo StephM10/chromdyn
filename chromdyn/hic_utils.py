@@ -115,28 +115,28 @@ class HiCManager:
         Returns:
             np.ndarray: Averaged Hi-C contact matrix.
         """
-        avg_mat = np.zeros(mat.shape)
+        avg_mat = np.zeros_like(mat)
+        n = mat.shape[0]
 
         # Loop through each diagonal of the matrix
-        for i in range(mat.shape[0]):
+        for i in range(n):
             # Normalize diagonal values by the average frequency and add to avg_mat
-            avg_mat += np.diagflat(
-                np.nanmean(np.diag(mat, k=i)) * np.ones(len(np.diag(mat, k=i))), i
-            )
-
-        # Reflect the upper triangle to the lower triangle to make it symmetric
-        avg_mat = avg_mat.T + np.triu(avg_mat, 1)
+            avg_val = np.nanmean(np.diag(mat, k=i))
+            idx = np.arange(n - i)
+            # Set the upper diagonal
+            avg_mat[idx, idx + i] = avg_val
+            # Set the lower diagonal if not the main diagonal
+            if i > 0:
+                avg_mat[idx + i, idx] = avg_val
 
         return avg_mat
 
     def update_kth_neighbor(self, matrix, k, val):
-        res = (
-            matrix
-            - np.diagflat(np.diag(matrix, k=k), k=k)
-            - np.diagflat(np.diag(matrix, k=-k), k=-k)
-            + np.diagflat(np.ones(len(np.diag(matrix, k=k))) * val, k=k)
-            + np.diagflat(np.ones(len(np.diag(matrix, k=-k))) * val, k=-k)
-        )
+        res = matrix.copy()
+        n = matrix.shape[0]
+        idx = np.arange(n - k)
+        res[idx, idx + k] = val
+        res[idx + k, idx] = val
         return res
 
     def normalize_by_kth_neighbors(self, matrix, k):

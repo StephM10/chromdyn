@@ -292,6 +292,7 @@ class Analyzer:
         sampling_step: int = 1,
         num_bins: int = 100,
         platform: str = "auto",
+        chunk_size: Optional[int] = None,
     ) -> Dict[str, np.ndarray]:
         """
         Calculate spatial velocity correlation C(r) = <v_i . v_j>.
@@ -312,6 +313,8 @@ class Analyzer:
             Number of bins for distance.
         platform : str
             'auto', 'CPU', or 'CUDA'.
+        chunk_size : int, optional
+            Number of beads to process simultaneously to cap memory usage.
 
         Returns
         -------
@@ -322,11 +325,11 @@ class Analyzer:
 
         if use_gpu:
             return Analyzer._calculate_spatial_vel_corr_gpu(
-                coords, velocities, bead_types, dist_range, sampling_step, num_bins
+                coords, velocities, bead_types, dist_range, sampling_step, num_bins, chunk_size
             )
         else:
             return Analyzer._calculate_spatial_vel_corr_cpu(
-                coords, velocities, bead_types, dist_range, sampling_step, num_bins
+                coords, velocities, bead_types, dist_range, sampling_step, num_bins, chunk_size
             )
 
     # =========================================================================
@@ -451,11 +454,13 @@ class Analyzer:
         dist_range: float,
         sampling_step: int = 1,
         num_bins: int = 50,
+        chunk_size: Optional[int] = None,
     ) -> Dict[str, np.ndarray]:
         """
         (Vectorized, GPU) calculate spatial velocity correlation C(r) = <v_i · v_j>.
 
         In CPU, loop over frames, but calculate all O(N^2) on GPU.
+        Optional batching over particles with chunk_size guards against GPU OOM.
         """
         print("Calculating Spatial Correlation on GPU...")
         n_frames, n_beads, _ = coords.shape
@@ -473,30 +478,14 @@ class Analyzer:
         ]
         type_pairs = sorted(list(set(type_pairs)))
 
-        # --- 2. RATIONALE: pre-calculate masks and *once* transfer to GPU ---
-        rows, cols = np.triu_indices(n_beads, k=1)
-        rows_cp = cp.asarray(rows)
-        cols_cp = cp.asarray(cols)
-
-        bead_types_i = bead_types[rows]
-        bead_types_j = bead_types[cols]
-
-        pair_masks_cp = {}
-        for key in type_pairs:
-            t1, t2 = key.split("-")
-            if t1 == t2:
-                mask = (bead_types_i == t1) & (bead_types_j == t2)
-            else:
-                mask = ((bead_types_i == t1) & (bead_types_j == t2)) | (
-                    (bead_types_i == t2) & (bead_types_j == t1)
-                )
-            pair_masks_cp[key] = cp.asarray(mask)
-
         bins_cp = cp.asarray(bins)
 
         # 3. RATIONALE: initialize accumulators on GPU
         total_corr_cp = {key: cp.zeros(num_bins) for key in ["general"] + type_pairs}
         counts_cp = {key: cp.zeros(num_bins) for key in ["general"] + type_pairs}
+
+        if chunk_size is None:
+            chunk_size = n_beads
 
         # 4. loop over sampled frames on CPU
         for frame_idx in range(0, n_frames, sampling_step):
@@ -505,44 +494,67 @@ class Analyzer:
             frame_coords_cp = cp.asarray(coords[frame_idx], dtype=cp.float32)
             frame_vels_cp = cp.asarray(velocities[frame_idx], dtype=cp.float32)
 
-            # 6. RATIONALE: execute all O(N^2) calculations on GPU
+            for start_i in range(0, n_beads, chunk_size):
+                end_i = min(start_i + chunk_size, n_beads)
 
-            # a. distance matrix: use broadcast (N, 1, 3) - (1, N, 3) -> (N, N, 3) -> (N, N)
-            dist_matrix_cp = cp.linalg.norm(
-                frame_coords_cp[:, None, :] - frame_coords_cp[None, :, :], axis=2
-            )
+                # Distance matrix block: (chunk_size, n_beads)
+                coords_i = frame_coords_cp[start_i:end_i]
+                dist_matrix_block = cp.linalg.norm(
+                    coords_i[:, None, :] - frame_coords_cp[None, :, :], axis=2
+                )
 
-            # b. dot product matrix: (N, 3) @ (3, N) -> (N, N)
-            v_dot_v_cp = frame_vels_cp @ frame_vels_cp.T
+                # VdotV block: (chunk_size, n_beads)
+                vels_i = frame_vels_cp[start_i:end_i]
+                v_dot_v_block = vels_i @ frame_vels_cp.T
 
-            # c. extract upper triangle
-            all_dists_cp = dist_matrix_cp[rows_cp, cols_cp]
-            all_dots_cp = v_dot_v_cp[rows_cp, cols_cp]
+                # Extract upper triangle parts only to avoid double counting and self-correlation
+                for i_local in range(end_i - start_i):
+                    i_global = start_i + i_local
+                    if i_global + 1 >= n_beads:
+                        break
 
-            # d. digitize
-            all_bin_indices_cp = cp.digitize(all_dists_cp, bins_cp[1:])
+                    # Slicing from i_global+1 to end for upper triangle
+                    all_dists_cp = dist_matrix_block[i_local, i_global + 1 :]
+                    all_dots_cp = v_dot_v_block[i_local, i_global + 1 :]
 
-            # 7. RATIONALE: use bincount on GPU for vectorized accumulation
-            valid_mask_cp = all_bin_indices_cp < num_bins
+                    # d. digitize
+                    all_bin_indices_cp = cp.digitize(all_dists_cp, bins_cp[1:])
 
-            # accumulate 'general'
-            valid_bins_cp = all_bin_indices_cp[valid_mask_cp]
-            valid_dots_cp = all_dots_cp[valid_mask_cp]
-            total_corr_cp["general"] += cp.bincount(
-                valid_bins_cp, weights=valid_dots_cp, minlength=num_bins
-            )
-            counts_cp["general"] += cp.bincount(valid_bins_cp, minlength=num_bins)
+                    # 7. RATIONALE: use bincount on GPU for vectorized accumulation
+                    valid_mask_cp = all_bin_indices_cp < num_bins
 
-            # accumulate by type
-            for key, type_mask_cp in pair_masks_cp.items():
-                final_mask_cp = valid_mask_cp & type_mask_cp
-                if cp.any(final_mask_cp):
-                    type_bins_cp = all_bin_indices_cp[final_mask_cp]
-                    type_dots_cp = all_dots_cp[final_mask_cp]
-                    total_corr_cp[key] += cp.bincount(
-                        type_bins_cp, weights=type_dots_cp, minlength=num_bins
-                    )
-                    counts_cp[key] += cp.bincount(type_bins_cp, minlength=num_bins)
+                    # accumulate 'general'
+                    valid_bins_cp = all_bin_indices_cp[valid_mask_cp]
+                    valid_dots_cp = all_dots_cp[valid_mask_cp]
+
+                    if valid_bins_cp.size > 0:
+                        total_corr_cp["general"] += cp.bincount(
+                            valid_bins_cp, weights=valid_dots_cp, minlength=num_bins
+                        )
+                        counts_cp["general"] += cp.bincount(valid_bins_cp, minlength=num_bins)
+
+                    bead_type_i = bead_types[i_global]
+                    bead_types_j = bead_types[i_global + 1 :]
+
+                    for key in type_pairs:
+                        t1, t2 = key.split("-")
+
+                        if t1 == t2:
+                            type_mask = (bead_type_i == t1) & (bead_types_j == t2)
+                        else:
+                            type_mask = ((bead_type_i == t1) & (bead_types_j == t2)) | (
+                                (bead_type_i == t2) & (bead_types_j == t1)
+                            )
+                        type_mask_cp = cp.asarray(type_mask)
+
+                        final_mask_cp = valid_mask_cp & type_mask_cp
+                        if cp.any(final_mask_cp):
+                            type_bins_cp = all_bin_indices_cp[final_mask_cp]
+                            type_dots_cp = all_dots_cp[final_mask_cp]
+                            total_corr_cp[key] += cp.bincount(
+                                type_bins_cp, weights=type_dots_cp, minlength=num_bins
+                            )
+                            counts_cp[key] += cp.bincount(type_bins_cp, minlength=num_bins)
 
         # 8. calculate final average on GPU
         results_cp = {}
@@ -580,9 +592,9 @@ class Analyzer:
 
     @staticmethod
     def _calculate_spatial_vel_corr_cpu(
-        coords, velocities, bead_types, dist_range, sampling_step, num_bins
+        coords, velocities, bead_types, dist_range, sampling_step, num_bins, chunk_size=None
     ):
-        """(CPU) Vectorized spatial velocity correlation using NumPy."""
+        """(CPU) Vectorized spatial velocity correlation using NumPy with optional batching."""
         print("Calculating Spatial Velocity Correlation on CPU...")
 
         n_frames, n_beads, _ = coords.shape
@@ -603,71 +615,73 @@ class Analyzer:
             )
         )
 
-        # Pre-calc indices (CPU is efficient with indexing)
-        rows, cols = np.triu_indices(n_beads, k=1)
-
-        bead_types_i = bead_types[rows]
-        bead_types_j = bead_types[cols]
-
-        pair_masks = {}
-        for key in type_pairs:
-            t1, t2 = key.split("-")
-            if t1 == t2:
-                mask = (bead_types_i == t1) & (bead_types_j == t2)
-            else:
-                mask = ((bead_types_i == t1) & (bead_types_j == t2)) | (
-                    (bead_types_i == t2) & (bead_types_j == t1)
-                )
-            pair_masks[key] = mask
-
         total_corr = {key: np.zeros(num_bins) for key in ["general"] + type_pairs}
         counts = {key: np.zeros(num_bins) for key in ["general"] + type_pairs}
 
-        # Loop over frames (Vectorized inside frame)
+        if chunk_size is None:
+            chunk_size = n_beads
+
+        # Loop over frames
         for frame_idx in range(0, n_frames, sampling_step):
             frame_coords = coords[frame_idx]  # (N, 3)
             frame_vels = velocities[frame_idx]  # (N, 3)
 
-            # a. Distance Matrix (Broadcasting)
-            # Warning: For very large N (>5000), this creates a large N*N matrix.
-            # CPU RAM is usually sufficient, but be aware.
-            dist_matrix = np.linalg.norm(
-                frame_coords[:, None, :] - frame_coords[None, :, :], axis=2
-            )
+            for start_i in range(0, n_beads, chunk_size):
+                end_i = min(start_i + chunk_size, n_beads)
 
-            # b. Dot Product
-            v_dot_v = frame_vels @ frame_vels.T
-
-            # c. Extract upper triangle
-            all_dists = dist_matrix[rows, cols]
-            all_dots = v_dot_v[rows, cols]
-
-            # d. Digitize
-            all_bin_indices = np.digitize(all_dists, bins[1:])
-
-            # e. Accumulate (using np.bincount)
-            valid_mask = all_bin_indices < num_bins
-
-            # General
-            valid_bins = all_bin_indices[valid_mask]
-            valid_dots = all_dots[valid_mask]
-
-            if valid_bins.size > 0:
-                total_corr["general"] += np.bincount(
-                    valid_bins, weights=valid_dots, minlength=num_bins
+                # Distance matrix block: (chunk_size, n_beads)
+                coords_i = frame_coords[start_i:end_i]
+                dist_matrix_block = np.linalg.norm(
+                    coords_i[:, None, :] - frame_coords[None, :, :], axis=2
                 )
-                counts["general"] += np.bincount(valid_bins, minlength=num_bins)
 
-            # By Type
-            for key, type_mask in pair_masks.items():
-                final_mask = valid_mask & type_mask
-                if np.any(final_mask):
-                    type_bins = all_bin_indices[final_mask]
-                    type_dots = all_dots[final_mask]
-                    total_corr[key] += np.bincount(
-                        type_bins, weights=type_dots, minlength=num_bins
-                    )
-                    counts[key] += np.bincount(type_bins, minlength=num_bins)
+                # VdotV block: (chunk_size, n_beads)
+                vels_i = frame_vels[start_i:end_i]
+                v_dot_v_block = vels_i @ frame_vels.T
+
+                # Extract upper triangle parts only to avoid double counting and self-correlation
+                for i_local in range(end_i - start_i):
+                    i_global = start_i + i_local
+                    if i_global + 1 >= n_beads:
+                        break
+
+                    # Slicing from i_global+1 to end for upper triangle
+                    all_dists = dist_matrix_block[i_local, i_global + 1 :]
+                    all_dots = v_dot_v_block[i_local, i_global + 1 :]
+
+                    all_bin_indices = np.digitize(all_dists, bins[1:])
+                    valid_mask = all_bin_indices < num_bins
+
+                    valid_bins = all_bin_indices[valid_mask]
+                    valid_dots = all_dots[valid_mask]
+
+                    if valid_bins.size > 0:
+                        total_corr["general"] += np.bincount(
+                            valid_bins, weights=valid_dots, minlength=num_bins
+                        )
+                        counts["general"] += np.bincount(valid_bins, minlength=num_bins)
+
+                    bead_type_i = bead_types[i_global]
+                    bead_types_j = bead_types[i_global + 1 :]
+
+                    for key in type_pairs:
+                        t1, t2 = key.split("-")
+
+                        if t1 == t2:
+                            type_mask = (bead_type_i == t1) & (bead_types_j == t2)
+                        else:
+                            type_mask = ((bead_type_i == t1) & (bead_types_j == t2)) | (
+                                (bead_type_i == t2) & (bead_types_j == t1)
+                            )
+
+                        final_mask = valid_mask & type_mask
+                        if np.any(final_mask):
+                            type_bins = all_bin_indices[final_mask]
+                            type_dots = all_dots[final_mask]
+                            total_corr[key] += np.bincount(
+                                type_bins, weights=type_dots, minlength=num_bins
+                            )
+                            counts[key] += np.bincount(type_bins, minlength=num_bins)
 
         # Final Average
         results = {}
