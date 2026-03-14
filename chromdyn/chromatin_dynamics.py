@@ -101,6 +101,7 @@ class ChromatinDynamics:
         stability_report_interval: int = 500,
         energy_report_interval: int = 1000,
         pos_report_interval: int = 1000,
+        force_reinitialize: bool = True,
     ) -> None:
         """Sets up the integrator, platform, context, and attaches reporters."""
 
@@ -196,6 +197,7 @@ class ChromatinDynamics:
                 logger=self.logger,
                 kinetic_threshold=5.0,
                 potential_threshold=5.0,
+                force_reinitialize=force_reinitialize,
             )
             self.simulation.reporters.append(self.reporters["stability"])
             self.logger.info(f"Stability reporter created: {path}")

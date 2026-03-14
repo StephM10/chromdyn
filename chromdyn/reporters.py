@@ -171,15 +171,17 @@ class StabilityReporter:
         kinetic_threshold: float = 5.0,
         potential_threshold: float = 1000.0,
         scale: float = 1.0,
+        force_reinitialize: bool = True,
     ):
         self.saveFile = open(filename, "w")
         self.interval: int = reportInterval
         self.kinetic_threshold: float = kinetic_threshold
         self.potential_threshold: float = potential_threshold
         self.scale: float = scale
+        self.force_reinitialize: bool = force_reinitialize
         self.logger = logger or LogManager().get_logger(__name__)
         self.logger.info(
-            f"StabilityReporter initialized with thresholds: K.E. = {self.kinetic_threshold}, P.E. = {self.potential_threshold}"
+            f"StabilityReporter initialized with thresholds: K.E. = {self.kinetic_threshold}, P.E. = {self.potential_threshold}, force_reinitialize={self.force_reinitialize}"
         )
 
     def describeNextReport(
@@ -226,16 +228,26 @@ class StabilityReporter:
             or abs(e_potential) / e_kinetic_expected > self.potential_threshold
         ):
 
-            seed = np.random.randint(100_000)
-            simulation.context.setVelocitiesToTemperature(temperature, seed)
-            self.saveFile.write(
-                f"<<INSTABILITY | Reinitialized velocities>> Step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}\n"
-            )
-            self.saveFile.flush()
-            if simulation.currentStep % (self.interval * 100) == 0:
-                self.logger.warning(
-                    f"<<INSTABILITY | Reinitialized velocities>> at step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}"
+            if self.force_reinitialize:
+                seed = np.random.randint(100_000)
+                simulation.context.setVelocitiesToTemperature(temperature, seed)
+                self.saveFile.write(
+                    f"<<INSTABILITY | Reinitialized velocities>> Step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}\n"
                 )
+                self.saveFile.flush()
+                if simulation.currentStep % (self.interval * 100) == 0:
+                    self.logger.warning(
+                        f"<<INSTABILITY | Reinitialized velocities>> at step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}"
+                    )
+            else:
+                self.saveFile.write(
+                    f"<<INSTABILITY | Detected but NOT reinitialized velocities>> Step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}\n"
+                )
+                self.saveFile.flush()
+                if simulation.currentStep % (self.interval * 100) == 0:
+                    self.logger.warning(
+                        f"<<INSTABILITY | Detected but NOT reinitialized velocities>> at step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}"
+                    )
 
 
 class EnergyReporter:

@@ -245,16 +245,15 @@ def visualize(
         print("Error: Topology not found in trajectory.")
         return
 
-    chain_info_list = traj.chain_info
-    n_chains = len(chain_info_list)
-    bead_counts = [count for _, count in chain_info_list]
-
-    # Calculate indices
-    cumulative_indices = np.cumsum([0] + bead_counts)
-    chain_selections = [
-        np.arange(start, end)
-        for start, end in zip(cumulative_indices[:-1], cumulative_indices[1:])
-    ]
+    chain_selections = []
+    if hasattr(traj, "topology") and traj.topology is not None:
+        for chain in traj.topology.chains():
+            sel = [atom.index for atom in chain.atoms()]
+            if len(sel) > 0:
+                chain_selections.append(np.array(sel))
+                
+    n_chains = len(chain_selections)
+    bead_counts = [len(sel) for sel in chain_selections]
 
     # --- 2. Load Coordinates (With Fix) ---
     polymer_coords_orig = []
@@ -588,17 +587,20 @@ def visualize_animation(
         print("Error: Topology not found.")
         return
 
-    chain_info = traj.chain_info
-    n_chains = len(chain_info)
-    bead_counts = [c[1] for c in chain_info]
+    chain_selections = []
+    if hasattr(traj, "topology") and traj.topology is not None:
+        for chain in traj.topology.chains():
+            sel = [atom.index for atom in chain.atoms()]
+            if len(sel) > 0:
+                chain_selections.append(np.array(sel))
+                
+    n_chains = len(chain_selections)
+    bead_counts = [len(sel) for sel in chain_selections]
 
-    cumulative_indices = np.cumsum([0] + bead_counts)
-    all_bead_indices = np.concatenate(
-        [
-            np.arange(s, e)
-            for s, e in zip(cumulative_indices[:-1], cumulative_indices[1:])
-        ]
-    )
+    if n_chains > 0:
+        all_bead_indices = np.concatenate(chain_selections)
+    else:
+        all_bead_indices = np.array([], dtype=int)
     total_beads = len(all_bead_indices)
 
     total_frames = traj.n_frames
