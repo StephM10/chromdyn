@@ -1342,13 +1342,17 @@ class Trajectory:
         return info
 
     # As requested, this function is added to the Trajectory class
-    def compute_rg_type(self, get_components: bool = False):
+    def compute_rg_type(
+        self, get_components: bool = False, custom_types: Optional[List] = None
+    ):
         """
         Function to compute Radius of Gyration (Rg) classified by particle type.
 
         Parameters:
             get_components (bool): If True, returns both total Rg and its XYZ components.
                                 Default is False.
+            custom_types (list, optional): A list of custom bead types. If provided,
+                                this will be used instead of self.chrom_seq.
 
         Returns:
             results (dict): A dictionary containing Rg data.
@@ -1365,7 +1369,18 @@ class Trajectory:
         # 1. Get coordinates and sequence from SELF
         # Dimension: (T, N, 3)
         all_positions = np.asarray(self.xyz(frames=[0, None, 1], bead_selection=None))
-        bead_types = np.asarray(self.chrom_seq)
+
+        if custom_types is not None:
+            print("Notice: Using custom-defined bead types for Rg calculation.")
+            bead_types = np.asarray(custom_types)
+        else:
+            bead_types = np.asarray(self.chrom_seq)
+
+        if bead_types.shape[0] != all_positions.shape[1]:
+            raise ValueError(
+                f"bead_types length ({bead_types.shape[0]}) must match "
+                f"number of beads in trajectory ({all_positions.shape[1]})"
+            )
 
         # 2. Initialize result dictionary
         results = {}
