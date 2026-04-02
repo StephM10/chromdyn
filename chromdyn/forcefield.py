@@ -552,8 +552,8 @@ class ForceFieldManager:
         self,
         interaction_matrix: Union[List[List[float]], np.ndarray],
         type_labels: List[str],
-        mu: float = 5.0,
-        rc: float = 1.5,
+        mu: float = 2.0,
+        rc: float = 2.0,
         group: int = 5,
         verbose: bool = True,
     ) -> None:

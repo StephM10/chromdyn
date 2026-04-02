@@ -292,8 +292,8 @@ class HiCManager:
     def gen_hic_from_cndb(
         self,
         traj_file,
-        mu,
-        rc,
+        mu = 2.0,
+        rc = 2.0,
         p=None,
         platform="CPU",
         parallel: bool = True,  # RE-INTRODUCED this parameter
@@ -612,7 +612,9 @@ def _calc_HiC_from_traj_array_gpu(traj, mu, rc, p=None, boxes=None, batch_size=N
             # D. Probability Function
             if p is not None:
                 # Add epsilon to prevent div by zero
-                term_power = 0.5 * (rc / (r + 1e-10)) ** p
+                if r == 0:
+                    r = 1e-10
+                term_power = 0.5 * (rc / r) ** p
 
                 prob = cp.where(r <= rc, 0.5 * (1 + cp.tanh(mu * (rc - r))), term_power)
             else:
