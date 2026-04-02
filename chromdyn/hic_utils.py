@@ -612,8 +612,7 @@ def _calc_HiC_from_traj_array_gpu(traj, mu, rc, p=None, boxes=None, batch_size=N
             # D. Probability Function
             if p is not None:
                 # Add epsilon to prevent div by zero
-                if r == 0:
-                    r = 1e-10
+                r = cp.where(r == 0, 1e-10, r)
                 term_power = 0.5 * (rc / r) ** p
 
                 prob = cp.where(r <= rc, 0.5 * (1 + cp.tanh(mu * (rc - r))), term_power)
