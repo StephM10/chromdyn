@@ -29,6 +29,7 @@ class EnergyLandscapeOptimizer:
         scheduler_step: int = 100,
         scheduler_eta_min: float = 0.001,
         scheduler_T_max: int = 120,
+        sgd_batch_fraction: float = 0.5,
         save_dir: str = "opt_params",
     ):
         """
@@ -36,7 +37,9 @@ class EnergyLandscapeOptimizer:
 
         Parameters:
             mu, rc: Model hyperparameters.
-            method: Optimizer method, e.g., "adam", "nadam", "rmsprop", "adagrad", "sgd".
+            method: Optimizer method, e.g., "adam", "nadam", "rmsprop", "adagrad", "sgd", "gd".
+                - "gd": Vanilla (batch) gradient descent using the full gradient.
+                - "sgd": Stochastic gradient descent with mini-batch sampling of matrix entries.
             eta: Initial learning rate.
             beta1, beta2, epsilon: Adam-related hyperparameters.
             it: Initial iteration counter.
@@ -46,6 +49,7 @@ class EnergyLandscapeOptimizer:
             scheduler_step: Number of iterations per step decay.
             scheduler_eta_min: Minimum learning rate for the cosine scheduler.
             scheduler_T_max: Total iterations for cosine annealing.
+            sgd_batch_fraction: Fraction of matrix entries to sample per SGD step (0, 1]. Default 0.5.
         """
         self.beta1 = beta1
         self.beta2 = beta2
@@ -59,6 +63,7 @@ class EnergyLandscapeOptimizer:
         self.force_field = None
         self.updated_force_field = None
         self.error = None
+        self.sgd_batch_fraction = sgd_batch_fraction
         self.save_dir = save_dir
         Path(self.save_dir).mkdir(parents=True, exist_ok=True)
 
@@ -195,8 +200,19 @@ class EnergyLandscapeOptimizer:
                 np.sqrt(self.opt_params["G_dw"]) + self.epsilon
             )
 
-        elif self.method == "sgd":
+        elif self.method == "gd":
             w = lambda_t - self.eta * grad
+
+        elif self.method == "sgd":
+            # True stochastic gradient descent: randomly sample a fraction of
+            # upper-triangular gradient entries, then symmetrize.
+            rand_mask = np.random.rand(*grad.shape) < self.sgd_batch_fraction
+            rand_mask = np.triu(rand_mask, k=1)
+            rand_mask = rand_mask | rand_mask.T
+            np.fill_diagonal(rand_mask, False)
+            # Scale by 1/fraction so the expected value equals the full gradient
+            stochastic_grad = grad * rand_mask / self.sgd_batch_fraction
+            w = lambda_t - self.eta * stochastic_grad
 
         self.save_optimization_params()
         self.t += 1
