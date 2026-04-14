@@ -37,8 +37,8 @@ class ForceFieldManager:
         self.topology = topology
         self.num_particles = topology.getNumAtoms()
         self.system = system
-        self.Nonbonded_cutoff = Nonbonded_cutoff
-        self.Nonbonded_method = (
+        self.nonbonded_cutoff = Nonbonded_cutoff
+        self.nonbonded_method = (
             CustomNonbondedForce.CutoffNonPeriodic
             if Nonbonded_method == "NonPeriodic"
             else CustomNonbondedForce.CutoffPeriodic
@@ -46,6 +46,52 @@ class ForceFieldManager:
         self.forceDict: Dict[str, object] = {}
         self.force_name_map: Dict[int, str] = {}
         self.exclude_bonds_from_NonBonded = exclude_bonds_from_NonBonded
+
+    def set_nonbonded_method(self, method: str) -> None:
+        """Update nonbonded method for this manager and all existing CustomNonbondedForce objects.
+        method ∈ {'NonPeriodic','Periodic'}.
+        """
+        from openmm import CustomNonbondedForce
+
+        self.nonbonded_method = (
+            CustomNonbondedForce.CutoffNonPeriodic
+            if method == "NonPeriodic"
+            else CustomNonbondedForce.CutoffPeriodic
+        )
+
+        if method == "Periodic":
+            # get box vector
+            box_vectors = self.system.getDefaultPeriodicBoxVectors()
+            if (
+                box_vectors[0].x == 0
+                and box_vectors[1].y == 0
+                and box_vectors[2].z == 0
+            ):
+                self.logger.warning(
+                    "PBC requested but DefaultPeriodicBoxVectors are zero! PBC will likely fail."
+                )
+                min_box_dim = 99999.9  # avoid division by zero, but OpenMM will still throw an error
+            else:
+                lengths = [box_vectors[0].x, box_vectors[1].y, box_vectors[2].z]
+                min_box_dim = min(lengths)
+
+            # check cutoff
+            if self.nonbonded_cutoff > min_box_dim / 2.0:
+                new_cutoff = (
+                    min_box_dim / 2.0 - 0.01
+                )  # slightly adjust in case of float error
+                self.logger.warning(
+                    f"Requested cutoff {self.nonbonded_cutoff} nm is too large for "
+                    f"box dimension {min_box_dim} nm. Clamping cutoff to {new_cutoff:.4f} nm."
+                )
+                self.nonbonded_cutoff = new_cutoff
+
+        for name, force in self.forceDict.items():
+            if force.__class__.__name__ == "CustomNonbondedForce":
+                force.setNonbondedMethod(self.nonbonded_method)
+                force.setCutoffDistance(self.nonbonded_cutoff)
+                print(f"Updated nonbonded method for {name} to {method}.")
+                self.logger.info(f"Updated nonbonded method for {name} to {method}.")
 
     def register_force(self, force_obj: object, name: str, **kwargs: Any) -> None:
         if (
@@ -358,8 +404,8 @@ class ForceFieldManager:
         repul_energy = "0.5 * Ecut * (1.0 + tanh((k_rep * (r_rep - r))))"
         avoidance_force = CustomNonbondedForce(repul_energy)
         avoidance_force.setForceGroup(group)
-        avoidance_force.setCutoffDistance(self.Nonbonded_cutoff)
-        avoidance_force.setNonbondedMethod(self.Nonbonded_method)
+        avoidance_force.setCutoffDistance(self.nonbonded_cutoff)
+        avoidance_force.setNonbondedMethod(self.nonbonded_method)
 
         avoidance_force.addGlobalParameter("Ecut", Ecut)
         avoidance_force.addGlobalParameter("r_rep", r)
@@ -371,7 +417,7 @@ class ForceFieldManager:
 
         self.logger.info("Adding Self-avoidance force with parameters:")
         self.logger.info(
-            f"Ecut={Ecut}, k_rep={k}, r_rep={r}, cutoff={self.Nonbonded_cutoff}, group={group}"
+            f"Ecut={Ecut}, k_rep={k}, r_rep={r}, cutoff={self.nonbonded_cutoff}, group={group}"
         )
         self.register_force(avoidance_force, "SelfAvoidance")
 
@@ -391,8 +437,8 @@ class ForceFieldManager:
         lj_force.addPerParticleParameter("sigma_LJ")
 
         lj_force.setForceGroup(group)
-        lj_force.setCutoffDistance(self.Nonbonded_cutoff)
-        lj_force.setNonbondedMethod(self.Nonbonded_method)
+        lj_force.setCutoffDistance(self.nonbonded_cutoff)
+        lj_force.setNonbondedMethod(self.nonbonded_method)
 
         num_particles = getattr(self, "num_particles", self.system.getNumParticles())
         if epsilon is None:
@@ -417,7 +463,7 @@ class ForceFieldManager:
 
         self.logger.info("Adding Lennard-Jones force:")
         self.logger.info(
-            f"Particles:{num_particles}, epsilon = {np.unique(epsilon_values)}, sigma={np.unique(sigma_values)}, cutoff={self.Nonbonded_cutoff}, group={group}"
+            f"Particles:{num_particles}, epsilon = {np.unique(epsilon_values)}, sigma={np.unique(sigma_values)}, cutoff={self.nonbonded_cutoff}, group={group}"
         )
         self.register_force(lj_force, "LennardJones")
 
@@ -442,8 +488,8 @@ class ForceFieldManager:
         wca_force.addPerParticleParameter("sigma_wca")
 
         wca_force.setForceGroup(group)
-        wca_force.setCutoffDistance(self.Nonbonded_cutoff)
-        wca_force.setNonbondedMethod(self.Nonbonded_method)
+        wca_force.setCutoffDistance(self.nonbonded_cutoff)
+        wca_force.setNonbondedMethod(self.nonbonded_method)
 
         num_particles = getattr(self, "num_particles", self.system.getNumParticles())
 
@@ -471,7 +517,7 @@ class ForceFieldManager:
         self.logger.info("Adding WCA force:")
         self.logger.info(
             f"Particles: {num_particles}, epsilon = {np.unique(epsilon_values)}, "
-            f"sigma = {np.unique(sigma_values)}, cutoff = {self.Nonbonded_cutoff}, group = {group}"
+            f"sigma = {np.unique(sigma_values)}, cutoff = {self.nonbonded_cutoff}, group = {group}"
         )
         self.register_force(wca_force, "WCA")
 
@@ -486,8 +532,8 @@ class ForceFieldManager:
         repul_energy = "(sigma / r) ^ 12"
         hard_repel_force = CustomNonbondedForce(repul_energy)
         hard_repel_force.setForceGroup(group)
-        hard_repel_force.setCutoffDistance(self.Nonbonded_cutoff)
-        hard_repel_force.setNonbondedMethod(self.Nonbonded_method)
+        hard_repel_force.setCutoffDistance(self.nonbonded_cutoff)
+        hard_repel_force.setNonbondedMethod(self.nonbonded_method)
 
         hard_repel_force.addGlobalParameter("sigma", sigma)
 
@@ -497,7 +543,7 @@ class ForceFieldManager:
 
         self.logger.info("Adding Hard-core repulsion force with parameters:")
         self.logger.info(
-            f"sigma={sigma}, cutoff={self.Nonbonded_cutoff}, group={group}"
+            f"sigma={sigma}, cutoff={self.nonbonded_cutoff}, group={group}"
         )
 
         self.register_force(hard_repel_force, "HardCoreLJ")
@@ -506,8 +552,8 @@ class ForceFieldManager:
         self,
         interaction_matrix: Union[List[List[float]], np.ndarray],
         type_labels: List[str],
-        mu: float = 5.0,
-        rc: float = 1.5,
+        mu: float = 2.0,
+        rc: float = 2.0,
         group: int = 5,
         verbose: bool = True,
     ) -> None:
@@ -557,8 +603,8 @@ class ForceFieldManager:
 
         type_force = CustomNonbondedForce(energy_expr)
         type_force.setForceGroup(group)
-        type_force.setCutoffDistance(self.Nonbonded_cutoff)
-        type_force.setNonbondedMethod(self.Nonbonded_method)
+        type_force.setCutoffDistance(self.nonbonded_cutoff)
+        type_force.setNonbondedMethod(self.nonbonded_method)
         type_force.addGlobalParameter("mu", self.mu)
         type_force.addGlobalParameter("rc", self.rc)
 
@@ -574,7 +620,7 @@ class ForceFieldManager:
             f"Adding Type-to-Type interaction (force group {group}, {num_types} types)."
         )
         self.logger.info(
-            f"Parameters -> mu: {mu}, rc: {rc}, cutoff: {self.Nonbonded_cutoff}"
+            f"Parameters -> mu: {mu}, rc: {rc}, cutoff: {self.nonbonded_cutoff}"
         )
 
         self.register_force(type_force, "TypeToType")
