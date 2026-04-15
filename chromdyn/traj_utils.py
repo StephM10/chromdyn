@@ -221,6 +221,209 @@ class Analyzer:
             )
 
     @staticmethod
+    def compute_tangent_correlation(
+        positions: np.ndarray,
+        max_s: Optional[int] = None,
+        bond_indices: Optional[np.ndarray] = None,
+        device: str = 'gpu',
+    ) -> dict:
+        R"""
+        Compute the tangent-tangent correlation function and estimate persistent length.
+
+        The tangent correlation function is defined as:
+            C(s) = <û_i · û_{i+s}>
+        where û_i is the unit tangent (bond) vector between bead i and i+1,
+        and s is the bond index separation.
+
+        For a Worm-Like Chain (WLC) model, C(s) = exp(-s·b / Lp),
+        where b is the mean bond length and Lp is the persistent length.
+
+        Parameters
+        ----------
+        positions : np.ndarray
+            Coordinates array of shape (N, 3) for a single frame,
+            or (T, N, 3) for a trajectory.
+        max_s : int, optional
+            Maximum bond separation to compute.  If ``None``, determined
+            automatically from two competing constraints:
+
+            - **Upper bound** (noise): ``int(n_bonds * NOISE_FRAC)`` where
+              ``NOISE_FRAC = 0.5``.  At larger separations, too few tangent
+              pairs contribute per C(s) value → noisy.
+            - **Lower bound** (fit quality): ``MIN_FIT_POINTS = 10``.
+              Fewer data points make the exponential fit unreliable.
+
+            If upper < lower, the segment is too short for a robust Lp
+            estimate; C(s) is still computed up to the upper bound but
+            ``fit_reliable`` is set to ``False``.
+
+            A hard cap of 200 is always applied for computational cost.
+        bond_indices : np.ndarray, optional
+            If provided, only these bond indices (into the full bond array)
+            are used. This allows computing tangent correlations for a
+            *subset* of bonds (e.g., within a contiguous type segment).
+            Bond index i corresponds to the vector r_{i+1} - r_i.
+        device : str, default ``'gpu'``
+            Compute backend.  ``'gpu'`` uses CuPy for accelerated
+            bond-vector / dot-product computation (requires CuPy).
+            The final Lp fit is always performed on CPU.
+
+        Returns
+        -------
+        dict
+            'tangent_corr'    : np.ndarray of shape (max_s + 1,)
+                                C(s) for s = 0, 1, ..., max_s.  C(0) = 1.
+            'contour_length'  : np.ndarray of shape (max_s + 1,)
+                                Cumulative contour distance = s * mean_bond_length.
+            'Lp'              : float or np.nan
+                                Fitted persistent length (units of position).
+            'mean_bond_length': float
+                                Average bond length over all selected bonds/frames.
+            'fit_reliable'    : bool
+                                ``True`` if max_s >= MIN_FIT_POINTS, i.e. enough
+                                data points were available for a robust fit.
+        """
+        positions = np.asarray(positions)
+
+        # ---- Unify to (T, N, 3) ----
+        if positions.ndim == 2:
+            positions = positions[np.newaxis, :, :]  # (1, N, 3)
+        elif positions.ndim != 3:
+            raise ValueError(
+                f"positions must have shape (N, 3) or (T, N, 3), got {positions.shape}"
+            )
+
+        # ---- Select compute backend ----
+        use_gpu = (device.lower() == 'gpu')
+        if use_gpu and not CUPY_AVAILABLE:
+            print("CuPy not available. Falling back to CPU.")
+            use_gpu = False
+        xp = cp if use_gpu else np
+
+        # Transfer to device
+        positions_d = xp.asarray(positions)
+
+        # ---- Bond vectors & unit tangents ----
+        # bond_vectors[:, i, :] = positions[:, i+1, :] - positions[:, i, :]
+        all_bond_vectors = positions_d[:, 1:, :] - positions_d[:, :-1, :]  # (T, N-1, 3)
+        all_bond_lengths = xp.linalg.norm(
+            all_bond_vectors, axis=-1, keepdims=True
+        )  # (T, N-1, 1)
+
+        # Avoid division by zero for degenerate bonds
+        safe_lengths = xp.where(all_bond_lengths > 0, all_bond_lengths, 1.0)
+        all_unit_tangents = all_bond_vectors / safe_lengths  # (T, N-1, 3)
+
+        # ---- Subset selection ----
+        if bond_indices is not None:
+            bond_indices_np = np.asarray(bond_indices)
+            # For segment-based computation, bond_indices must be *contiguous*
+            # so that index separations still correspond to chain separations.
+            if use_gpu:
+                bi = cp.asarray(bond_indices_np)
+            else:
+                bi = bond_indices_np
+            unit_tangents = all_unit_tangents[:, bi, :]       # (T, M, 3)
+            bond_lengths_sel = all_bond_lengths[:, bi, 0]     # (T, M)
+        else:
+            unit_tangents = all_unit_tangents
+            bond_lengths_sel = all_bond_lengths[:, :, 0]
+
+        n_bonds = unit_tangents.shape[1]  # M
+
+        # ---- Determine max_s: dual-bound logic ----
+        # Upper bound (noise): don't exceed this fraction of n_bonds so that
+        #   each C(s) is averaged over enough tangent pairs.
+        # Lower bound (fit):   need at least this many s-values for a
+        #   reliable exponential fit of ln C(s).
+        NOISE_FRAC = 0.5
+        MIN_FIT_POINTS = 10
+        GLOBAL_CAP = 200  # absolute cap for computational cost
+
+        max_s_from_noise = max(1, int(n_bonds * NOISE_FRAC))
+
+        if max_s is None:
+            max_s = min(max_s_from_noise, GLOBAL_CAP)
+        else:
+            # User-specified: only apply the hard physical limit
+            max_s = min(max_s, n_bonds - 1)
+
+        # Can we meet the fit-quality requirement?
+        fit_reliable = (max_s >= MIN_FIT_POINTS)
+
+        if max_s < 1:
+            # Not enough bonds to compute any correlation
+            mean_bl = float(xp.mean(bond_lengths_sel))
+            if use_gpu:
+                del positions_d, all_bond_vectors, all_bond_lengths
+                del safe_lengths, all_unit_tangents, unit_tangents, bond_lengths_sel
+                cp.get_default_memory_pool().free_all_blocks()
+            return {
+                'tangent_corr': np.array([1.0]),
+                'contour_length': np.array([0.0]),
+                'Lp': np.nan,
+                'mean_bond_length': mean_bl,
+                'fit_reliable': False,
+            }
+
+        mean_bond_length = float(xp.mean(bond_lengths_sel))
+
+        # ---- Tangent correlation C(s) ----
+        tangent_corr_d = xp.zeros(max_s + 1)
+        tangent_corr_d[0] = 1.0  # C(0) = <û · û> = 1
+
+        for s in range(1, max_s + 1):
+            # Dot products for all valid pairs and all frames
+            dots = xp.sum(
+                unit_tangents[:, :n_bonds - s, :] * unit_tangents[:, s:, :],
+                axis=-1,
+            )  # (T, n_bonds - s)
+            tangent_corr_d[s] = xp.mean(dots)
+
+        # ---- Transfer result to CPU for fitting ----
+        if use_gpu:
+            tangent_corr = cp.asnumpy(tangent_corr_d)
+            # Free GPU memory
+            del positions_d, all_bond_vectors, all_bond_lengths
+            del safe_lengths, all_unit_tangents, unit_tangents
+            del bond_lengths_sel, tangent_corr_d
+            cp.get_default_memory_pool().free_all_blocks()
+        else:
+            tangent_corr = np.asarray(tangent_corr_d)
+
+        # ---- Fit persistent length via log-linear regression (CPU) ----
+        # C(s) = exp(-s * b / Lp)  =>  ln C(s) = -(b / Lp) * s
+        s_vals = np.arange(max_s + 1)
+        contour_length = s_vals * mean_bond_length
+
+        # Only fit where C(s) > 0 (exclude noise floor / negative values)
+        valid = tangent_corr > 0.01  # threshold to avoid log(~0)
+        valid[0] = False  # exclude s=0 from fitting (trivially 1)
+
+        if np.sum(valid) >= 2:
+            log_C = np.log(tangent_corr[valid])
+            s_fit = s_vals[valid]
+            # Zero-intercept linear fit: ln C = slope * s
+            # slope = -b / Lp
+            # Normal equation for y = a*x (no intercept):
+            slope = np.dot(s_fit, log_C) / np.dot(s_fit, s_fit)
+            if slope < 0:
+                Lp = -mean_bond_length / slope
+            else:
+                Lp = np.nan  # Non-decaying correlation → infinite or undefined Lp
+        else:
+            Lp = np.nan
+
+        return {
+            'tangent_corr': tangent_corr,
+            'contour_length': contour_length,
+            'Lp': Lp,
+            'mean_bond_length': mean_bond_length,
+            'fit_reliable': fit_reliable,
+        }
+
+
+    @staticmethod
     def wrap_coordinates(positions: np.ndarray, box_vectors: np.ndarray) -> np.ndarray:
         """
         Convert Unwrapped coordinates to Wrapped coordinates (inside the box).
@@ -1427,6 +1630,307 @@ class Trajectory:
                     results[key_name] = rg_data
 
         return results
+
+    def compute_persistent_length_type(
+        self,
+        custom_types: Optional[List] = None,
+        max_bond_sep: Optional[int] = None,
+        boundary_mode: str = 'segment',
+        device: str = 'gpu',
+    ):
+        R"""
+        Compute persistent length (Lp) classified by particle type.
+
+        Follows the same pattern as ``compute_rg_type``.  Returns the tangent
+        correlation function C(s) and the fitted Lp for the whole chain
+        (``'general'``) and for each bead-type separately.
+
+        Persistent length is extracted from the tangent-tangent correlation:
+            C(s) = <û_i · û_{i+s}>  ≈  exp(-s·b / Lp)
+        where b is the mean bond length.
+
+        Parameters
+        ----------
+        custom_types : list, optional
+            A list of custom bead types.  If provided, used instead of
+            ``self.chrom_seq``.
+        max_bond_sep : int, optional
+            Maximum bond-index separation *s* to compute.  ``None`` lets the
+            ``Analyzer`` auto-select using dual-bound logic:
+
+            - **Upper bound**: ``int(n_bonds * 0.5)`` — caps at half the
+              segment length so each C(s) is averaged over enough pairs.
+            - **Lower bound**: ``10`` data points minimum for a reliable
+              exponential fit.
+
+            When these bounds are incompatible (segment too short), C(s) is
+            still computed but ``fit_reliable`` is ``False`` and Lp may be
+            unreliable.
+        device : str, default ``'gpu'``
+            Compute backend passed to ``Analyzer.compute_tangent_correlation``.
+            ``'gpu'`` uses CuPy for acceleration (requires CuPy).
+        boundary_mode : str, default ``'segment'``
+            How to handle type boundaries when computing per-type Lp.
+
+            ``'segment'`` (default)
+                For each type, find *contiguous* segments of that type along
+                the chain.  Tangent correlations are computed strictly within
+                each segment.  Bonds at the segment boundaries are included.
+
+            ``'exclude_boundary'``
+                Same as ``'segment'``, but additionally **removes** the first
+                and last bond of each segment if the segment does not sit at
+                the chain terminus.  This avoids any influence from the
+                junction between different types.
+
+            ``'include_boundary'``
+                A bond is assigned to type X if **at least one** of its two
+                endpoint beads has type X.  Tangent correlations for type X
+                are then computed only between bonds that are both assigned to
+                X **and** form a contiguous sub-sequence.
+
+        Returns
+        -------
+        results : dict
+            Keys are ``'general'`` and each unique type name (e.g. ``'A'``,
+            ``'B'``).  Each value is a dict containing:
+
+            - ``'tangent_corr'``    : np.ndarray, shape (max_s+1,) — C(s)
+            - ``'contour_length'``  : np.ndarray, shape (max_s+1,) — s × ⟨b⟩
+            - ``'Lp'``              : float — fitted persistent length
+            - ``'mean_bond_length'``: float — average bond length for that subset
+            - ``'fit_reliable'``    : bool — whether enough points for robust fit
+
+        Notes
+        -----
+        For heterogeneous chains (e.g. A-B copolymer), the *general* result
+        uses ALL bonds regardless of type, while each type entry only uses
+        the bonds *within* contiguous segments of that type (subject to
+        ``boundary_mode``).  Segments with fewer than ``2 * MIN_FIT_POINTS``
+        bonds (= 20 by default, after boundary trimming) are skipped since
+        the dual-bound constraints cannot both be satisfied.
+        """
+
+        # ============================================================
+        # 1. Load coordinates & types
+        # ============================================================
+        all_positions = np.asarray(
+            self.xyz(frames=[0, None, 1], bead_selection=None)
+        )  # (T, N, 3)
+
+        if custom_types is not None:
+            print("Notice: Using custom-defined bead types for Lp calculation.")
+            bead_types = np.asarray(custom_types)
+        else:
+            bead_types = np.asarray(self.chrom_seq)
+
+        n_beads = all_positions.shape[1]
+        if bead_types.shape[0] != n_beads:
+            raise ValueError(
+                f"bead_types length ({bead_types.shape[0]}) must match "
+                f"number of beads in trajectory ({n_beads})"
+            )
+
+        # ============================================================
+        # 2. 'general' — whole chain
+        # ============================================================
+        results = {}
+        results['general'] = Analyzer.compute_tangent_correlation(
+            all_positions, max_s=max_bond_sep, device=device
+        )
+
+        # ============================================================
+        # 3. Per-type computation
+        # ============================================================
+        unique_types = np.unique(bead_types)
+
+        if len(unique_types) <= 1:
+            # Homogeneous chain — nothing extra to compute
+            return results
+
+        for t_type in unique_types:
+            key_name = str(t_type)
+
+            # --- Determine bond indices for this type ---
+            segments = self._find_contiguous_segments(bead_types, t_type)
+
+            # Convert bead-level segments to bond-level index lists
+            bond_index_lists = []
+            for seg_start, seg_end in segments:
+                # Bonds in this segment: indices [seg_start, seg_end - 2]
+                # (bond i connects bead i to bead i+1)
+                seg_n_beads = seg_end - seg_start
+                if seg_n_beads < 2:
+                    continue  # need at least 2 beads for 1 bond
+
+                b_start = seg_start
+                b_end = seg_end - 1  # exclusive, bond indices
+
+                # --- Apply boundary_mode trimming ---
+                if boundary_mode == 'exclude_boundary':
+                    # Trim first bond if not at chain start
+                    if seg_start > 0:
+                        b_start += 1
+                    # Trim last bond if not at chain end
+                    if seg_end < n_beads:
+                        b_end -= 1
+                elif boundary_mode == 'include_boundary':
+                    # Extend to include bonds at boundaries (one endpoint matches)
+                    # Left boundary: bond (seg_start - 1) if exists
+                    if seg_start > 0:
+                        b_start -= 1
+                    # Right boundary: bond (seg_end - 1) if exists and < n_beads - 1
+                    if seg_end < n_beads:
+                        b_end += 1
+                elif boundary_mode != 'segment':
+                    raise ValueError(
+                        f"Unknown boundary_mode '{boundary_mode}'. "
+                        f"Choose from 'segment', 'exclude_boundary', 'include_boundary'."
+                    )
+
+                if b_end > b_start:
+                    bond_index_lists.append(np.arange(b_start, b_end))
+
+            if not bond_index_lists:
+                # No valid segments for this type
+                results[key_name] = {
+                    'tangent_corr': np.array([1.0]),
+                    'contour_length': np.array([0.0]),
+                    'Lp': np.nan,
+                    'mean_bond_length': np.nan,
+                    'fit_reliable': False,
+                }
+                continue
+
+            # --- Compute tangent correlation per segment, then aggregate ---
+            # Strategy: for each contiguous segment, compute C(s) using the
+            #           static method with bond_indices, then weight-average
+            #           across segments by the number of contributing pairs.
+            #
+            # Segment skip criterion:
+            #   A segment with n_bonds bonds yields max_s = n_bonds * 0.5.
+            #   For fit_reliable, we need max_s >= MIN_FIT_POINTS (=10).
+            #   Therefore: n_bonds >= 2 * MIN_FIT_POINTS (=20).
+            #   Shorter segments are skipped to avoid unreliable Lp.
+            MIN_SEG_BONDS = 20  # = 2 * MIN_FIT_POINTS used in Analyzer
+            seg_results = []
+            seg_weights = []  # weight = number of bonds in segment
+
+            for bond_idx in bond_index_lists:
+                seg_len = len(bond_idx)
+                if seg_len < MIN_SEG_BONDS:
+                    continue  # too short for both noise and fit constraints
+
+                seg_res = Analyzer.compute_tangent_correlation(
+                    all_positions,
+                    max_s=max_bond_sep,
+                    bond_indices=bond_idx,
+                    device=device,
+                )
+                seg_results.append(seg_res)
+                seg_weights.append(seg_len)
+
+            if not seg_results:
+                results[key_name] = {
+                    'tangent_corr': np.array([1.0]),
+                    'contour_length': np.array([0.0]),
+                    'Lp': np.nan,
+                    'mean_bond_length': np.nan,
+                    'fit_reliable': False,
+                }
+                continue
+
+            # Weighted average of tangent correlation across segments
+            # Pad shorter C(s) arrays with NaN, then do weighted nanmean
+            max_len = max(len(r['tangent_corr']) for r in seg_results)
+            weights_arr = np.array(seg_weights, dtype=float)
+
+            combined_corr = np.full((len(seg_results), max_len), np.nan)
+            for idx, r in enumerate(seg_results):
+                L = len(r['tangent_corr'])
+                combined_corr[idx, :L] = r['tangent_corr']
+
+            # Weighted nanmean along axis 0
+            # For each s, average only over segments that have a value
+            avg_corr = np.zeros(max_len)
+            for s_idx in range(max_len):
+                valid_mask = ~np.isnan(combined_corr[:, s_idx])
+                if np.any(valid_mask):
+                    w = weights_arr[valid_mask]
+                    avg_corr[s_idx] = np.average(
+                        combined_corr[valid_mask, s_idx], weights=w
+                    )
+                else:
+                    avg_corr[s_idx] = np.nan
+
+            # Weighted-average mean bond length
+            mean_bl = np.average(
+                [r['mean_bond_length'] for r in seg_results],
+                weights=weights_arr,
+            )
+
+            # Re-fit Lp from the aggregated C(s)
+            s_vals = np.arange(max_len)
+            contour_length = s_vals * mean_bl
+
+            valid = (~np.isnan(avg_corr)) & (avg_corr > 0.01)
+            valid[0] = False  # skip s=0
+
+            if np.sum(valid) >= 2:
+                log_C = np.log(avg_corr[valid])
+                s_fit = s_vals[valid]
+                slope = np.dot(s_fit, log_C) / np.dot(s_fit, s_fit)
+                Lp = -mean_bl / slope if slope < 0 else np.nan
+            else:
+                Lp = np.nan
+
+            # Aggregated fit_reliable: True only if all segments were reliable
+            all_reliable = all(r['fit_reliable'] for r in seg_results)
+
+            results[key_name] = {
+                'tangent_corr': avg_corr,
+                'contour_length': contour_length,
+                'Lp': Lp,
+                'mean_bond_length': mean_bl,
+                'fit_reliable': all_reliable,
+            }
+
+        return results
+
+    @staticmethod
+    def _find_contiguous_segments(
+        bead_types: np.ndarray, target_type
+    ) -> List[Tuple[int, int]]:
+        """
+        Find contiguous runs of *target_type* in a 1-D type array.
+
+        Parameters
+        ----------
+        bead_types : np.ndarray
+            1-D array of bead type labels.
+        target_type : str or comparable
+            The type to search for.
+
+        Returns
+        -------
+        list of (start, end)
+            Each tuple gives the **bead** index range [start, end) of a
+            contiguous segment of *target_type*.
+        """
+        mask = (bead_types == target_type)
+        segments = []
+        in_seg = False
+        start = 0
+        for i, val in enumerate(mask):
+            if val and not in_seg:
+                start = i
+                in_seg = True
+            elif not val and in_seg:
+                segments.append((start, i))
+                in_seg = False
+        if in_seg:
+            segments.append((start, len(mask)))
+        return segments
 
     def xyz_wrapped(self, frames=[0, None, 1], bead_selection=None, xyz_cols=[0, 1, 2]):
         """
