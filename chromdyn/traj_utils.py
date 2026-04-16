@@ -226,6 +226,7 @@ class Analyzer:
         max_s: Optional[int] = None,
         bond_indices: Optional[np.ndarray] = None,
         device: str = 'gpu',
+        box_vectors: Optional[np.ndarray] = None,
     ) -> dict:
         R"""
         Compute the tangent-tangent correlation function and estimate persistent length.
@@ -267,6 +268,9 @@ class Analyzer:
             Compute backend.  ``'gpu'`` uses CuPy for accelerated
             bond-vector / dot-product computation (requires CuPy).
             The final Lp fit is always performed on CPU.
+        box_vectors : np.ndarray, optional
+            Periodic box vectors to apply Minimum Image Convention (MIC)
+            for bond vectors. Shape ``(3,)``, ``(3, 3)``, or ``(T, 3, 3)``.
 
         Returns
         -------
@@ -282,6 +286,10 @@ class Analyzer:
             'fit_reliable'    : bool
                                 ``True`` if max_s >= MIN_FIT_POINTS, i.e. enough
                                 data points were available for a robust fit.
+            'r_squared'       : float or np.nan
+                                Coefficient of determination (R^2) for the fit.
+            'fit_details'     : str
+                                Detailed reason for the reliability status.
         """
         positions = np.asarray(positions)
 
@@ -306,6 +314,25 @@ class Analyzer:
         # ---- Bond vectors & unit tangents ----
         # bond_vectors[:, i, :] = positions[:, i+1, :] - positions[:, i, :]
         all_bond_vectors = positions_d[:, 1:, :] - positions_d[:, :-1, :]  # (T, N-1, 3)
+
+        # ---- Apply Minimum Image Convention (MIC) if box provided ----
+        if box_vectors is not None:
+            box_d = xp.asarray(box_vectors)
+            if box_d.ndim == 3:
+                # (T, 3, 3) -> diagonal -> (T, 1, 3)
+                box_diag = xp.diagonal(box_d, axis1=1, axis2=2)[:, xp.newaxis, :]
+            elif box_d.ndim == 1:
+                # (3,) -> (1, 1, 3)
+                box_diag = box_d[xp.newaxis, xp.newaxis, :]
+            elif box_d.ndim == 2 and box_d.shape == (3, 3):
+                # (3, 3) -> (1, 1, 3)
+                box_diag = xp.diagonal(box_d)[:, xp.newaxis, :]
+            else:
+                raise ValueError("box_vectors must be (3,), (3, 3), or (T, 3, 3)")
+            
+            # MIC: delta = delta - box_diag * round(delta / box_diag)
+            all_bond_vectors -= box_diag * xp.round(all_bond_vectors / box_diag)
+
         all_bond_lengths = xp.linalg.norm(
             all_bond_vectors, axis=-1, keepdims=True
         )  # (T, N-1, 1)
@@ -364,6 +391,8 @@ class Analyzer:
                 'Lp': np.nan,
                 'mean_bond_length': mean_bl,
                 'fit_reliable': False,
+                'r_squared': np.nan,
+                'fit_details': "Segment too short to compute correlation.",
             }
 
         mean_bond_length = float(xp.mean(bond_lengths_sel))
@@ -396,9 +425,20 @@ class Analyzer:
         s_vals = np.arange(max_s + 1)
         contour_length = s_vals * mean_bond_length
 
+        fit_details = ""
+        if not fit_reliable:
+            fit_details = f"Segment too short (max_s={max_s} < {MIN_FIT_POINTS}). "
+
+        if max_s >= 1 and tangent_corr[1] <= 0:
+            fit_reliable = False
+            fit_details += "C(1) <= 0: Chain exhibits local anti-correlation or strong flexibility. WLC model is inapplicable."
+
         # Only fit where C(s) > 0 (exclude noise floor / negative values)
         valid = tangent_corr > 0.01  # threshold to avoid log(~0)
         valid[0] = False  # exclude s=0 from fitting (trivially 1)
+
+        Lp = np.nan
+        r_squared = np.nan
 
         if np.sum(valid) >= 2:
             log_C = np.log(tangent_corr[valid])
@@ -409,10 +449,30 @@ class Analyzer:
             slope = np.dot(s_fit, log_C) / np.dot(s_fit, s_fit)
             if slope < 0:
                 Lp = -mean_bond_length / slope
+                
+                # Calculate R^2 for zero-intercept regression
+                y_pred = slope * s_fit
+                ss_res = np.sum((log_C - y_pred)**2)
+                ss_tot = np.sum((log_C - np.mean(log_C))**2)
+                if ss_tot > 0:
+                    r_squared = 1 - (ss_res / ss_tot)
+                else:
+                    r_squared = 1.0
+
+                if fit_reliable and r_squared < 0.8:
+                    fit_reliable = False
+                    fit_details += f"Poor exponential fit (R^2 = {r_squared:.2f})."
             else:
-                Lp = np.nan  # Non-decaying correlation → infinite or undefined Lp
+                if fit_reliable:
+                    fit_reliable = False
+                    fit_details += "Non-decaying correlation (slope >= 0)."
         else:
-            Lp = np.nan
+            if fit_reliable:
+                fit_reliable = False
+                fit_details += "Not enough positive C(s) data points for fitting."
+
+        if fit_reliable and not fit_details:
+            fit_details = "Fit is reliable."
 
         return {
             'tangent_corr': tangent_corr,
@@ -420,6 +480,8 @@ class Analyzer:
             'Lp': Lp,
             'mean_bond_length': mean_bond_length,
             'fit_reliable': fit_reliable,
+            'r_squared': r_squared,
+            'fit_details': fit_details.strip(),
         }
 
 
@@ -1637,6 +1699,7 @@ class Trajectory:
         max_bond_sep: Optional[int] = None,
         boundary_mode: str = 'segment',
         device: str = 'gpu',
+        use_pbc: bool = True,
     ):
         R"""
         Compute persistent length (Lp) classified by particle type.
@@ -1669,6 +1732,11 @@ class Trajectory:
         device : str, default ``'gpu'``
             Compute backend passed to ``Analyzer.compute_tangent_correlation``.
             ``'gpu'`` uses CuPy for acceleration (requires CuPy).
+        use_pbc : bool, default ``True``
+            If ``True`` and ``self.box_vectors`` is available, apply the
+            Minimum Image Convention (MIC) when calculating bond vectors.
+            This prevents artificially huge bond lengths when coordinates are
+            wrapped inside the periodic simulation box.
         boundary_mode : str, default ``'segment'``
             How to handle type boundaries when computing per-type Lp.
 
@@ -1700,6 +1768,8 @@ class Trajectory:
             - ``'Lp'``              : float — fitted persistent length
             - ``'mean_bond_length'``: float — average bond length for that subset
             - ``'fit_reliable'``    : bool — whether enough points for robust fit
+            - ``'r_squared'``       : float — R^2 value of the fit
+            - ``'fit_details'``     : str — details of fit reliability
 
         Notes
         -----
@@ -1717,6 +1787,9 @@ class Trajectory:
         all_positions = np.asarray(
             self.xyz(frames=[0, None, 1], bead_selection=None)
         )  # (T, N, 3)
+
+        # Use PBC Minimum Image Convention if requested AND box info is available
+        box_to_use = self.box_vectors if use_pbc else None
 
         if custom_types is not None:
             print("Notice: Using custom-defined bead types for Lp calculation.")
@@ -1736,7 +1809,10 @@ class Trajectory:
         # ============================================================
         results = {}
         results['general'] = Analyzer.compute_tangent_correlation(
-            all_positions, max_s=max_bond_sep, device=device
+            all_positions,
+            max_s=max_bond_sep,
+            device=device,
+            box_vectors=box_to_use,
         )
 
         # ============================================================
@@ -1799,6 +1875,8 @@ class Trajectory:
                     'Lp': np.nan,
                     'mean_bond_length': np.nan,
                     'fit_reliable': False,
+                    'r_squared': np.nan,
+                    'fit_details': "No valid segments.",
                 }
                 continue
 
@@ -1826,6 +1904,7 @@ class Trajectory:
                     max_s=max_bond_sep,
                     bond_indices=bond_idx,
                     device=device,
+                    box_vectors=box_to_use,
                 )
                 seg_results.append(seg_res)
                 seg_weights.append(seg_len)
@@ -1837,6 +1916,8 @@ class Trajectory:
                     'Lp': np.nan,
                     'mean_bond_length': np.nan,
                     'fit_reliable': False,
+                    'r_squared': np.nan,
+                    'fit_details': "All segments too short.",
                 }
                 continue
 
@@ -1873,26 +1954,68 @@ class Trajectory:
             s_vals = np.arange(max_len)
             contour_length = s_vals * mean_bl
 
+            # Assess reliability based on aggregated correlation
+            MIN_FIT_POINTS = 10
+            fit_reliable = (max_len - 1 >= MIN_FIT_POINTS) # max_len is max_s + 1
+            fit_details = ""
+            if not fit_reliable:
+                fit_details = f"Aggregated max_s={max_len - 1} < {MIN_FIT_POINTS}. "
+
+            if max_len > 1 and avg_corr[1] <= 0:
+                fit_reliable = False
+                fit_details += "C(1) <= 0: Chain exhibits local anti-correlation or strong flexibility. WLC model is inapplicable."
+
             valid = (~np.isnan(avg_corr)) & (avg_corr > 0.01)
             valid[0] = False  # skip s=0
+
+            r_squared = np.nan
+            Lp = np.nan
 
             if np.sum(valid) >= 2:
                 log_C = np.log(avg_corr[valid])
                 s_fit = s_vals[valid]
                 slope = np.dot(s_fit, log_C) / np.dot(s_fit, s_fit)
-                Lp = -mean_bl / slope if slope < 0 else np.nan
+                if slope < 0:
+                    Lp = -mean_bl / slope
+                    
+                    # Calculate R^2
+                    y_pred = slope * s_fit
+                    ss_res = np.sum((log_C - y_pred)**2)
+                    ss_tot = np.sum((log_C - np.mean(log_C))**2)
+                    if ss_tot > 0:
+                        r_squared = 1 - (ss_res / ss_tot)
+                    else:
+                        r_squared = 1.0
+                    
+                    if fit_reliable and r_squared < 0.8:
+                        fit_reliable = False
+                        fit_details += f"Poor exponential fit (R^2 = {r_squared:.2f})."
+                else:
+                    if fit_reliable:
+                        fit_reliable = False
+                        fit_details += "Non-decaying correlation (slope >= 0)."
             else:
-                Lp = np.nan
+                if fit_reliable:
+                    fit_reliable = False
+                    fit_details += "Not enough positive C(s) data points for fitting."
 
-            # Aggregated fit_reliable: True only if all segments were reliable
+            # Aggregated fit_reliable: also check if any individual segment failed to be reliable
             all_reliable = all(r['fit_reliable'] for r in seg_results)
+            if fit_reliable and not all_reliable:
+                fit_reliable = False
+                fit_details += "Some individual segments were unreliable."
+
+            if fit_reliable and not fit_details:
+                fit_details = "Fit is reliable."
 
             results[key_name] = {
                 'tangent_corr': avg_corr,
                 'contour_length': contour_length,
                 'Lp': Lp,
                 'mean_bond_length': mean_bl,
-                'fit_reliable': all_reliable,
+                'fit_reliable': fit_reliable,
+                'r_squared': r_squared,
+                'fit_details': fit_details.strip(),
             }
 
         return results
