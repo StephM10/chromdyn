@@ -43,6 +43,99 @@ class Analyzer:
     """
 
     @staticmethod
+    def _empty_persistent_length_fit() -> dict:
+        """Return a consistent payload for fits without valid uncertainty."""
+        return {
+            'Lp': np.nan,
+            'Lp_se': np.nan,
+            'Lp_ci95': (np.nan, np.nan),
+            'fit_slope': np.nan,
+            'fit_slope_se': np.nan,
+            'fit_cov': np.array([[np.nan]]),
+            'fit_n_points': 0,
+            'r_squared': np.nan,
+        }
+
+    @staticmethod
+    def _fit_persistent_length_from_corr(
+        tangent_corr: np.ndarray,
+        mean_bond_length: float,
+        min_fit_points: int = 10,
+        corr_threshold: float = 0.01,
+    ) -> dict:
+        """
+        Fit persistent length from tangent correlation and propagate fit uncertainty.
+
+        The fit uses the existing zero-intercept log-linear model:
+        ``log(C(s)) = slope * s`` and ``Lp = -mean_bond_length / slope``.
+        The returned covariance is one-dimensional because only ``slope`` is
+        fitted.
+        """
+        tangent_corr = np.asarray(tangent_corr)
+        s_vals = np.arange(len(tangent_corr))
+        valid = (~np.isnan(tangent_corr)) & (tangent_corr > corr_threshold)
+        if len(valid) > 0:
+            valid[0] = False
+
+        result = Analyzer._empty_persistent_length_fit()
+        n_fit = int(np.sum(valid))
+        result['fit_n_points'] = n_fit
+
+        if n_fit < 2:
+            return result
+
+        log_C = np.log(tangent_corr[valid])
+        s_fit = s_vals[valid]
+        x_sq_sum = np.dot(s_fit, s_fit)
+        if x_sq_sum <= 0:
+            return result
+
+        slope = np.dot(s_fit, log_C) / x_sq_sum
+        result['fit_slope'] = slope
+
+        if not np.isfinite(slope):
+            return result
+
+        if slope >= 0:
+            return result
+
+        Lp = -mean_bond_length / slope
+        y_pred = slope * s_fit
+        residuals = log_C - y_pred
+        ss_res = np.sum(residuals**2)
+        ss_tot = np.sum((log_C - np.mean(log_C))**2)
+        if ss_tot > 0:
+            r_squared = 1 - (ss_res / ss_tot)
+        else:
+            r_squared = 1.0
+
+        dof = n_fit - 1
+        slope_var = np.nan
+        slope_se = np.nan
+        Lp_se = np.nan
+        Lp_ci95 = (np.nan, np.nan)
+        if dof > 0:
+            residual_var = ss_res / dof
+            if np.isfinite(residual_var):
+                slope_var = residual_var / x_sq_sum
+                if slope_var >= 0:
+                    slope_se = np.sqrt(slope_var)
+                    Lp_se = abs(mean_bond_length / (slope**2)) * slope_se
+                    Lp_ci95 = (Lp - 1.96 * Lp_se, Lp + 1.96 * Lp_se)
+
+        result.update(
+            {
+                'Lp': Lp,
+                'Lp_se': Lp_se,
+                'Lp_ci95': Lp_ci95,
+                'fit_slope_se': slope_se,
+                'fit_cov': np.array([[slope_var]]),
+                'r_squared': r_squared,
+            }
+        )
+        return result
+
+    @staticmethod
     def _segment_solid_angle(
         p1: np.ndarray,
         p2: np.ndarray,
@@ -281,6 +374,11 @@ class Analyzer:
                                 Cumulative contour distance = s * mean_bond_length.
             'Lp'              : float or np.nan
                                 Fitted persistent length (units of position).
+            'Lp_se'           : float or np.nan
+                                Fit-based standard error of ``Lp`` from
+                                covariance propagation.
+            'Lp_ci95'         : tuple of float
+                                Approximate 95% confidence interval for ``Lp``.
             'mean_bond_length': float
                                 Average bond length over all selected bonds/frames.
             'fit_reliable'    : bool
@@ -288,6 +386,14 @@ class Analyzer:
                                 data points were available for a robust fit.
             'r_squared'       : float or np.nan
                                 Coefficient of determination (R^2) for the fit.
+            'fit_slope'       : float or np.nan
+                                Fitted zero-intercept slope of ``log(C(s))`` vs ``s``.
+            'fit_slope_se'    : float or np.nan
+                                Standard error of ``fit_slope``.
+            'fit_cov'         : np.ndarray
+                                One-by-one covariance matrix for ``fit_slope``.
+            'fit_n_points'    : int
+                                Number of positive correlation points used for fitting.
             'fit_details'     : str
                                 Detailed reason for the reliability status.
         """
@@ -388,11 +494,10 @@ class Analyzer:
             return {
                 'tangent_corr': np.array([1.0]),
                 'contour_length': np.array([0.0]),
-                'Lp': np.nan,
                 'mean_bond_length': mean_bl,
                 'fit_reliable': False,
-                'r_squared': np.nan,
                 'fit_details': "Segment too short to compute correlation.",
+                **Analyzer._empty_persistent_length_fit(),
             }
 
         mean_bond_length = float(xp.mean(bond_lengths_sel))
@@ -431,45 +536,32 @@ class Analyzer:
 
         if max_s >= 1 and tangent_corr[1] <= 0:
             fit_reliable = False
-            fit_details += "C(1) <= 0: Chain exhibits local anti-correlation or strong flexibility. WLC model is inapplicable."
+            fit_details += (
+                "C(1) <= 0: Chain exhibits local anti-correlation or strong "
+                "flexibility. WLC model is inapplicable."
+            )
 
-        # Only fit where C(s) > 0 (exclude noise floor / negative values)
-        valid = tangent_corr > 0.01  # threshold to avoid log(~0)
-        valid[0] = False  # exclude s=0 from fitting (trivially 1)
+        fit_result = Analyzer._fit_persistent_length_from_corr(
+            tangent_corr,
+            mean_bond_length=mean_bond_length,
+            min_fit_points=MIN_FIT_POINTS,
+        )
 
-        Lp = np.nan
-        r_squared = np.nan
-
-        if np.sum(valid) >= 2:
-            log_C = np.log(tangent_corr[valid])
-            s_fit = s_vals[valid]
-            # Zero-intercept linear fit: ln C = slope * s
-            # slope = -b / Lp
-            # Normal equation for y = a*x (no intercept):
-            slope = np.dot(s_fit, log_C) / np.dot(s_fit, s_fit)
-            if slope < 0:
-                Lp = -mean_bond_length / slope
-                
-                # Calculate R^2 for zero-intercept regression
-                y_pred = slope * s_fit
-                ss_res = np.sum((log_C - y_pred)**2)
-                ss_tot = np.sum((log_C - np.mean(log_C))**2)
-                if ss_tot > 0:
-                    r_squared = 1 - (ss_res / ss_tot)
-                else:
-                    r_squared = 1.0
-
-                if fit_reliable and r_squared < 0.8:
-                    fit_reliable = False
-                    fit_details += f"Poor exponential fit (R^2 = {r_squared:.2f})."
-            else:
-                if fit_reliable:
-                    fit_reliable = False
-                    fit_details += "Non-decaying correlation (slope >= 0)."
-        else:
+        if fit_result['fit_n_points'] < 2:
             if fit_reliable:
                 fit_reliable = False
                 fit_details += "Not enough positive C(s) data points for fitting."
+        elif not np.isfinite(fit_result['Lp']):
+            if fit_reliable:
+                fit_reliable = False
+                fit_details += "Persistent length fit produced a non-finite result."
+        elif fit_result['fit_slope'] >= 0:
+            if fit_reliable:
+                fit_reliable = False
+                fit_details += "Non-decaying correlation (slope >= 0)."
+        elif fit_reliable and fit_result['r_squared'] < 0.8:
+            fit_reliable = False
+            fit_details += f"Poor exponential fit (R^2 = {fit_result['r_squared']:.2f})."
 
         if fit_reliable and not fit_details:
             fit_details = "Fit is reliable."
@@ -477,11 +569,10 @@ class Analyzer:
         return {
             'tangent_corr': tangent_corr,
             'contour_length': contour_length,
-            'Lp': Lp,
             'mean_bond_length': mean_bond_length,
             'fit_reliable': fit_reliable,
-            'r_squared': r_squared,
             'fit_details': fit_details.strip(),
+            **fit_result,
         }
 
 
@@ -1700,6 +1791,8 @@ class Trajectory:
         boundary_mode: str = 'segment',
         device: str = 'gpu',
         use_pbc: bool = True,
+        positions: Optional[np.ndarray] = None,
+        box_vectors: Optional[np.ndarray] = None,
     ):
         R"""
         Compute persistent length (Lp) classified by particle type.
@@ -1733,10 +1826,15 @@ class Trajectory:
             Compute backend passed to ``Analyzer.compute_tangent_correlation``.
             ``'gpu'`` uses CuPy for acceleration (requires CuPy).
         use_pbc : bool, default ``True``
-            If ``True`` and ``self.box_vectors`` is available, apply the
-            Minimum Image Convention (MIC) when calculating bond vectors.
-            This prevents artificially huge bond lengths when coordinates are
-            wrapped inside the periodic simulation box.
+            If ``True`` and box vectors are available, apply the Minimum Image
+            Convention (MIC) when calculating bond vectors.
+        positions : np.ndarray, optional
+            Pre-loaded positions array of shape ``(T, N, 3)``. If ``None``, calls
+            ``self.xyz()``. Useful for providing concatenated coordinates from
+            multiple replicas.
+        box_vectors : np.ndarray, optional
+            Pre-loaded box vectors. If ``None``, uses ``self.box_vectors``. Useful
+            when providing concatenated coordinates.
         boundary_mode : str, default ``'segment'``
             How to handle type boundaries when computing per-type Lp.
 
@@ -1766,9 +1864,15 @@ class Trajectory:
             - ``'tangent_corr'``    : np.ndarray, shape (max_s+1,) — C(s)
             - ``'contour_length'``  : np.ndarray, shape (max_s+1,) — s × ⟨b⟩
             - ``'Lp'``              : float — fitted persistent length
+            - ``'Lp_se'``           : float — fit-based standard error of Lp
+            - ``'Lp_ci95'``         : tuple — approximate 95% confidence interval
             - ``'mean_bond_length'``: float — average bond length for that subset
             - ``'fit_reliable'``    : bool — whether enough points for robust fit
             - ``'r_squared'``       : float — R^2 value of the fit
+            - ``'fit_slope'``       : float — zero-intercept log-linear slope
+            - ``'fit_slope_se'``    : float — standard error of ``fit_slope``
+            - ``'fit_cov'``         : np.ndarray — covariance matrix for slope
+            - ``'fit_n_points'``    : int — number of points used in the fit
             - ``'fit_details'``     : str — details of fit reliability
 
         Notes
@@ -1784,12 +1888,15 @@ class Trajectory:
         # ============================================================
         # 1. Load coordinates & types
         # ============================================================
-        all_positions = np.asarray(
-            self.xyz(frames=[0, None, 1], bead_selection=None)
-        )  # (T, N, 3)
+        if positions is not None:
+            all_positions = np.asarray(positions)
+        else:
+            all_positions = np.asarray(
+                self.xyz(frames=[0, None, 1], bead_selection=None)
+            )  # (T, N, 3)
 
-        # Use PBC Minimum Image Convention if requested AND box info is available
-        box_to_use = self.box_vectors if use_pbc else None
+        source_box = box_vectors if box_vectors is not None else self.box_vectors
+        box_to_use = source_box if use_pbc else None
 
         if custom_types is not None:
             print("Notice: Using custom-defined bead types for Lp calculation.")
@@ -1872,11 +1979,10 @@ class Trajectory:
                 results[key_name] = {
                     'tangent_corr': np.array([1.0]),
                     'contour_length': np.array([0.0]),
-                    'Lp': np.nan,
                     'mean_bond_length': np.nan,
                     'fit_reliable': False,
-                    'r_squared': np.nan,
                     'fit_details': "No valid segments.",
+                    **Analyzer._empty_persistent_length_fit(),
                 }
                 continue
 
@@ -1913,11 +2019,10 @@ class Trajectory:
                 results[key_name] = {
                     'tangent_corr': np.array([1.0]),
                     'contour_length': np.array([0.0]),
-                    'Lp': np.nan,
                     'mean_bond_length': np.nan,
                     'fit_reliable': False,
-                    'r_squared': np.nan,
                     'fit_details': "All segments too short.",
+                    **Analyzer._empty_persistent_length_fit(),
                 }
                 continue
 
@@ -1963,41 +2068,32 @@ class Trajectory:
 
             if max_len > 1 and avg_corr[1] <= 0:
                 fit_reliable = False
-                fit_details += "C(1) <= 0: Chain exhibits local anti-correlation or strong flexibility. WLC model is inapplicable."
+                fit_details += (
+                    "C(1) <= 0: Chain exhibits local anti-correlation or strong "
+                    "flexibility. WLC model is inapplicable."
+                )
 
-            valid = (~np.isnan(avg_corr)) & (avg_corr > 0.01)
-            valid[0] = False  # skip s=0
+            fit_result = Analyzer._fit_persistent_length_from_corr(
+                avg_corr,
+                mean_bond_length=mean_bl,
+                min_fit_points=MIN_FIT_POINTS,
+            )
 
-            r_squared = np.nan
-            Lp = np.nan
-
-            if np.sum(valid) >= 2:
-                log_C = np.log(avg_corr[valid])
-                s_fit = s_vals[valid]
-                slope = np.dot(s_fit, log_C) / np.dot(s_fit, s_fit)
-                if slope < 0:
-                    Lp = -mean_bl / slope
-                    
-                    # Calculate R^2
-                    y_pred = slope * s_fit
-                    ss_res = np.sum((log_C - y_pred)**2)
-                    ss_tot = np.sum((log_C - np.mean(log_C))**2)
-                    if ss_tot > 0:
-                        r_squared = 1 - (ss_res / ss_tot)
-                    else:
-                        r_squared = 1.0
-                    
-                    if fit_reliable and r_squared < 0.8:
-                        fit_reliable = False
-                        fit_details += f"Poor exponential fit (R^2 = {r_squared:.2f})."
-                else:
-                    if fit_reliable:
-                        fit_reliable = False
-                        fit_details += "Non-decaying correlation (slope >= 0)."
-            else:
+            if fit_result['fit_n_points'] < 2:
                 if fit_reliable:
                     fit_reliable = False
                     fit_details += "Not enough positive C(s) data points for fitting."
+            elif not np.isfinite(fit_result['Lp']):
+                if fit_reliable:
+                    fit_reliable = False
+                    fit_details += "Persistent length fit produced a non-finite result."
+            elif fit_result['fit_slope'] >= 0:
+                if fit_reliable:
+                    fit_reliable = False
+                    fit_details += "Non-decaying correlation (slope >= 0)."
+            elif fit_reliable and fit_result['r_squared'] < 0.8:
+                fit_reliable = False
+                fit_details += f"Poor exponential fit (R^2 = {fit_result['r_squared']:.2f})."
 
             # Aggregated fit_reliable: also check if any individual segment failed to be reliable
             all_reliable = all(r['fit_reliable'] for r in seg_results)
@@ -2011,11 +2107,10 @@ class Trajectory:
             results[key_name] = {
                 'tangent_corr': avg_corr,
                 'contour_length': contour_length,
-                'Lp': Lp,
                 'mean_bond_length': mean_bl,
                 'fit_reliable': fit_reliable,
-                'r_squared': r_squared,
                 'fit_details': fit_details.strip(),
+                **fit_result,
             }
 
         return results
