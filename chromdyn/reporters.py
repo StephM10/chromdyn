@@ -13,6 +13,7 @@ from openmm.app import Topology
 import openmm.unit as unit
 from openmm import CMMotionRemover
 import os
+from datetime import datetime
 from .utilities import LogManager
 from pathlib import Path
 from typing import Union, Optional, Tuple
@@ -363,3 +364,156 @@ class EnergyReporter:
 
             self.saveFile.write("\n")
             self.saveFile.flush()
+
+
+class ForceFieldReporter:
+    """
+    Write-once reporter that records the complete force-field configuration
+    (energy expressions, all parameters, integrator settings, system metadata)
+    to a plain-text file at the time of simulation setup.
+
+    Call ``update_activity(F_seq, tau_seq)`` after ``set_activity()`` to append
+    the per-particle activity parameters to the same file.
+    """
+
+    def __init__(
+        self,
+        report_file: Union[str, Path],
+        force_field_manager,
+        integrator_manager,
+        system_info: dict,
+    ):
+        """
+        Parameters
+        ----------
+        report_file       : path to the output ``.txt`` file.
+        force_field_manager : the ``ForceFieldManager`` instance attached to the simulation.
+        integrator_manager  : the ``IntegratorManager`` instance attached to the simulation.
+        system_info         : dict with keys ``name``, ``num_particles``, ``mass``,
+                              ``PBC``, and optionally ``box_vectors``.
+        """
+        self.filename = str(report_file)
+        self.ff_man = force_field_manager
+        self.im = integrator_manager
+        self.system_info = system_info
+        self._write()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _nb_method_name(method_int: int) -> str:
+        names = {
+            0: "NoCutoff",
+            1: "CutoffNonPeriodic",
+            2: "CutoffPeriodic",
+            3: "Ewald",
+            4: "PME",
+            5: "LJPME",
+        }
+        return names.get(method_int, str(method_int))
+
+    def _force_block(self, force_obj, force_name: str) -> list:
+        """Return a list of formatted lines describing one OpenMM force."""
+        lines = []
+        lines.append(f"  Name              : {force_name}")
+        lines.append(f"  Class             : {force_obj.__class__.__name__}")
+        lines.append(f"  Group             : {force_obj.getForceGroup()}")
+
+        if hasattr(force_obj, "getEnergyFunction"):
+            lines.append(f"  Energy expression : {force_obj.getEnergyFunction()}")
+
+        if hasattr(force_obj, "getNumGlobalParameters") and force_obj.getNumGlobalParameters() > 0:
+            lines.append("  Global parameters :")
+            for i in range(force_obj.getNumGlobalParameters()):
+                pname = force_obj.getGlobalParameterName(i)
+                pval = force_obj.getGlobalParameterDefaultValue(i)
+                lines.append(f"    {pname} = {pval}")
+
+        if hasattr(force_obj, "getNumPerParticleParameters") and force_obj.getNumPerParticleParameters() > 0:
+            pp = [force_obj.getPerParticleParameterName(i) for i in range(force_obj.getNumPerParticleParameters())]
+            lines.append(f"  Per-particle params: {', '.join(pp)}")
+
+        if hasattr(force_obj, "getNumPerBondParameters") and force_obj.getNumPerBondParameters() > 0:
+            pb = [force_obj.getPerBondParameterName(i) for i in range(force_obj.getNumPerBondParameters())]
+            lines.append(f"  Per-bond params   : {', '.join(pb)}")
+
+        if hasattr(force_obj, "getCutoffDistance"):
+            try:
+                lines.append(f"  Cutoff (nm)       : {float(force_obj.getCutoffDistance()):.4f}")
+            except Exception:
+                pass
+
+        if hasattr(force_obj, "getNonbondedMethod"):
+            lines.append(f"  Nonbonded method  : {self._nb_method_name(force_obj.getNonbondedMethod())}")
+
+        for getter, label in [
+            ("getNumParticles", "Num particles     "),
+            ("getNumBonds",     "Num bonds         "),
+            ("getNumAngles",    "Num angles        "),
+            ("getNumExclusions","Num exclusions    "),
+        ]:
+            if hasattr(force_obj, getter):
+                lines.append(f"  {label}: {getattr(force_obj, getter)()}")
+
+        if hasattr(force_obj, "getFrequency"):
+            lines.append(f"  Removal frequency : {force_obj.getFrequency()}")
+
+        return lines
+
+    def _write(self) -> None:
+        """Write the full force-field report to disk."""
+        si = self.system_info
+        im = self.im
+        sep = "-" * 62
+        header = "=" * 62
+
+        with open(self.filename, "w") as fh:
+            fh.write(header + "\n")
+            fh.write("  chromdyn : Force-field Configuration\n")
+            fh.write(f"  Simulation : {si.get('name', '')}\n")
+            fh.write(f"  Created    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            fh.write(header + "\n\n")
+
+            # ---- SYSTEM ----
+            fh.write("[SYSTEM]\n")
+            fh.write(f"  num_particles     : {si['num_particles']}\n")
+            fh.write(f"  particle_mass (Da): {si['mass']}\n")
+            fh.write(f"  PBC               : {si['PBC']}\n")
+            bv = si.get("box_vectors")
+            if bv is not None:
+                fh.write(
+                    f"  box_vectors (nm)  : {tuple(bv[0])} | {tuple(bv[1])} | {tuple(bv[2])}\n"
+                )
+            fh.write("\n")
+
+            # ---- INTEGRATOR ----
+            fh.write("[INTEGRATOR]\n")
+            fh.write(f"  type              : {getattr(im, 'integrator_name', 'unknown')}\n")
+            fh.write(f"  temperature       : {getattr(im, 'temperature', 'N/A')}\n")
+            fh.write(f"  friction          : {getattr(im, 'friction', 'N/A')}\n")
+            fh.write(f"  timestep          : {getattr(im, 'timestep', 'N/A')}\n")
+            fh.write("\n")
+
+            # ---- FORCES ----
+            fh.write("[FORCES]\n")
+            for fname, fobj in self.ff_man.forceDict.items():
+                fh.write(sep + "\n")
+                for line in self._force_block(fobj, fname):
+                    fh.write(line + "\n")
+            fh.write(sep + "\n")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def update_activity(self, F_seq, tau_seq) -> None:
+        """
+        Append per-particle activity parameters to the existing report file.
+        Call this after ``ChromatinDynamics.set_activity()``.
+        """
+        with open(self.filename, "a") as fh:
+            fh.write("\n[ACTIVITY]\n")
+            fh.write(f"  F_seq   : {[float(x) for x in F_seq]}\n")
+            fh.write(f"  tau_seq : {[float(x) for x in tau_seq]}\n")

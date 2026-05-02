@@ -18,7 +18,7 @@ from .platforms import PlatformManager
 from .integrators import IntegratorManager
 from .forcefield import ForceFieldManager
 from .utilities import config_generator, LogManager
-from .reporters import SaveStructure, StabilityReporter, EnergyReporter
+from .reporters import SaveStructure, StabilityReporter, EnergyReporter, ForceFieldReporter
 from typing import Optional, Tuple, List, Dict, Union, Any
 
 
@@ -60,6 +60,7 @@ class ChromatinDynamics:
         self.topology = topology
         self.system = System()
         self.num_particles = topology.getNumAtoms()
+        self.mass = mass
         for _ in range(self.num_particles):
             self.system.addParticle(mass)
 
@@ -97,6 +98,7 @@ class ChromatinDynamics:
         friction: float = 0.1,
         save_pos: bool = True,
         save_energy: bool = True,
+        save_forcefield: bool = True,
         stability_check: bool = True,
         stability_report_interval: int = 500,
         energy_report_interval: int = 1000,
@@ -202,6 +204,22 @@ class ChromatinDynamics:
             self.simulation.reporters.append(self.reporters["stability"])
             self.logger.info(f"Stability reporter created: {path}")
 
+        if save_forcefield and self.output_dir is not None:
+            path = self.output_dir / f"{self.name}_forcefield.txt"
+            self.reporters["forcefield"] = ForceFieldReporter(
+                path,
+                force_field_manager=self.force_field_manager,
+                integrator_manager=self.integrator_manager,
+                system_info={
+                    "name": self.name,
+                    "num_particles": self.num_particles,
+                    "mass": self.mass,
+                    "PBC": PBC,
+                    "box_vectors": box_vectors,
+                },
+            )
+            self.logger.info(f"Force-field reporter created: {path}")
+
     def set_activity(self, F_seq: List, tau_seq: List):
 
         assert hasattr(
@@ -227,6 +245,9 @@ class ChromatinDynamics:
         self.logger.info(
             f"Added active force and correlation times for {len(F_seq)} particles."
         )
+
+        if "forcefield" in self.reporters:
+            self.reporters["forcefield"].update_activity(F_seq, tau_seq)
 
     def get_active_params(self, mono_id: int = None) -> Dict[str, Any]:
         assert (
