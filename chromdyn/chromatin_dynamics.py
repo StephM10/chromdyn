@@ -35,7 +35,7 @@ class ChromatinDynamics:
         platform_name: str = "CUDA",
         output_dir: str = "output",
         console_stream: bool = True,
-        mass: float = 1.0,
+        mass: Union[float, List[float], NDArray] = 1.0,
         write_logs: bool = True,
     ) -> None:
 
@@ -60,9 +60,32 @@ class ChromatinDynamics:
         self.topology = topology
         self.system = System()
         self.num_particles = topology.getNumAtoms()
-        self.mass = mass
-        for _ in range(self.num_particles):
-            self.system.addParticle(mass)
+        
+        # Handle scalar or array-like mass
+        if np.isscalar(mass):
+            self.masses = np.full(self.num_particles, float(mass))
+        else:
+            self.masses = np.asarray(mass, dtype=float)
+            if len(self.masses) != self.num_particles:
+                raise ValueError(f"Length of mass array ({len(self.masses)}) must match num_particles ({self.num_particles})")
+
+        # Optional: check mass consistency for atom types in topology
+        atom_types_dict = {}
+        for idx, atom in enumerate(self.topology.atoms()):
+            atype = atom.element
+            if atype not in atom_types_dict:
+                atom_types_dict[atype] = []
+            atom_types_dict[atype].append(self.masses[idx])
+
+        for atype, m_list in atom_types_dict.items():
+            if len(set(m_list)) > 1:
+                self.logger.warning(
+                    f"Atom type '{atype}' has inconsistent masses: {np.unique(m_list)}"
+                )
+
+        # Add particles to the system
+        for m in self.masses:
+            self.system.addParticle(float(m))
 
         self.logger.info(
             f"System initialized with {self.num_particles} particles. Output directory: {self.output_dir}"
@@ -213,7 +236,7 @@ class ChromatinDynamics:
                 system_info={
                     "name": self.name,
                     "num_particles": self.num_particles,
-                    "mass": self.mass,
+                    "mass": self.masses,
                     "PBC": PBC,
                     "box_vectors": box_vectors,
                 },

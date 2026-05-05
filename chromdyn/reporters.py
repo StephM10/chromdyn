@@ -460,6 +460,28 @@ class ForceFieldReporter:
         if hasattr(force_obj, "getFrequency"):
             lines.append(f"  Removal frequency : {force_obj.getFrequency()}")
 
+        if hasattr(force_obj, "getNumPerParticleParameters") and hasattr(force_obj, "getNumParticles"):
+            num_p = force_obj.getNumParticles()
+            if num_p > 0:
+                for i in range(force_obj.getNumPerParticleParameters()):
+                    pname = force_obj.getPerParticleParameterName(i)
+                    vals = []
+                    for p in range(num_p):
+                        try:
+                            # getParticleParameters returns (parameters_tuple)
+                            params = force_obj.getParticleParameters(p)
+                            vals.append(params[0][i])
+                        except Exception:
+                            pass
+                    if len(vals) == num_p:
+                        import numpy as np
+                        vals_arr = np.array(vals)
+                        if len(np.unique(vals_arr)) > 1:
+                            lines.append(f"  Per-particle param: {pname} (Heterogeneous array)")
+                            lines.append(f"  full_{pname}_array: {vals_arr.tolist()}")
+                        else:
+                            lines.append(f"  Per-particle param: {pname} = {vals_arr[0]}")
+
         return lines
 
     def _write(self) -> None:
@@ -476,10 +498,20 @@ class ForceFieldReporter:
             fh.write(f"  Created    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             fh.write(header + "\n\n")
 
-            # ---- SYSTEM ----
             fh.write("[SYSTEM]\n")
             fh.write(f"  num_particles     : {si['num_particles']}\n")
-            fh.write(f"  particle_mass (Da): {si['mass']}\n")
+            
+            mass_data = si.get("mass", 1.0)
+            if hasattr(mass_data, '__iter__'):
+                import numpy as np
+                mass_arr = np.array(mass_data)
+                if len(np.unique(mass_arr)) > 1:
+                    fh.write(f"  particle_mass (Da): Heterogeneous array\n")
+                    fh.write(f"  full_mass_array   : {mass_arr.tolist()}\n")
+                else:
+                    fh.write(f"  particle_mass (Da): {mass_arr[0]}\n")
+            else:
+                fh.write(f"  particle_mass (Da): {mass_data}\n")
             fh.write(f"  PBC               : {si['PBC']}\n")
             bv = si.get("box_vectors")
             if bv is not None:

@@ -243,7 +243,9 @@ class Analyzer:
 
     @staticmethod
     def compute_RG(
-        positions: np.ndarray, return_components: bool = False
+        positions: np.ndarray, 
+        return_components: bool = False,
+        bead_masses: Optional[np.ndarray] = None
     ) -> Union[float, np.ndarray, Tuple]:
         """
         Calculates the Radius of Gyration (Rg).
@@ -252,24 +254,33 @@ class Analyzer:
             positions: Coordinates array of shape (N, 3) or (T, N, 3).
             return_components: If True, returns a tuple (rg_total, rg_xyz).
                                rg_xyz will contain [rg_x, rg_y, rg_z].
+            bead_masses: Optional array of bead masses for mass-weighted Rg.
         """
         # receive traj.xyz() as positions
         positions = np.asarray(positions)
+
+        # 1. Handle masses and log choice
+        if bead_masses is not None:
+            masses = np.asarray(bead_masses)
+            print("Computing mass-weighted Radius of Gyration")
+        else:
+            masses = np.ones(positions.shape[-2])
+            print("Computing geometric Radius of Gyration (uniform mass)")
 
         # ---------------------------------------------------------
         # Case 1: Single Frame (N, 3)
         # ---------------------------------------------------------
         if positions.ndim == 2:
             # 1. Calculate Center of Mass
-            center_of_mass = np.mean(positions, axis=0)
+            center_of_mass = np.average(positions, axis=0, weights=masses)
 
             # 2. Calculate squared deviations for each dimension (x, y, z) separately
             # Shape remains (N, 3) here
             sq_deviations = (positions - center_of_mass) ** 2
 
-            # 3. Mean over particles (N) to get squared Rg components
+            # 3. Average over particles (N) to get squared Rg components
             # Shape becomes (3,) -> [Rgx^2, Rgy^2, Rgz^2]
-            rg_sq_components = np.mean(sq_deviations, axis=0)
+            rg_sq_components = np.average(sq_deviations, axis=0, weights=masses)
 
             # 4. Calculate Total Rg
             # Rg = sqrt(Rgx^2 + Rgy^2 + Rgz^2)
@@ -287,15 +298,15 @@ class Analyzer:
         elif positions.ndim == 3:
             # 1. Calculate Centers of Mass
             # Shape (T, 3)
-            centers_of_mass = np.mean(positions, axis=1)
+            centers_of_mass = np.average(positions, axis=1, weights=masses)
 
             # 2. Calculate squared deviations
             # Use broadcasting: (T, N, 3) - (T, 1, 3)
             sq_deviations = (positions - centers_of_mass[:, None, :]) ** 2
 
-            # 3. Mean over particles (axis 1) to get squared Rg components
+            # 3. Average over particles (axis 1) to get squared Rg components
             # Shape becomes (T, 3)
-            rg_sq_components = np.mean(sq_deviations, axis=1)
+            rg_sq_components = np.average(sq_deviations, axis=1, weights=masses)
 
             # 4. Calculate Total Rg per frame
             # Sum over xyz (axis 1 of the component array), then sqrt

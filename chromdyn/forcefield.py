@@ -396,29 +396,67 @@ class ForceFieldManager:
         self.register_force(confinement_force, "CylindricalConfinement")
 
     def add_self_avoidance(
-        self, Ecut: float = 4.0, k: float = 5.0, r: float = 1.0, group: int = 2
+        self, Ecut: float = 4.0, k: float = 5.0, r: float = 1.0, radii: Optional[Union[List[float], np.ndarray]] = None, group: int = 2
     ) -> None:
         """
         Adds soft-core self-avoidance force.
+        
+        Args:
+            Ecut (float): Energy cutoff parameter. Default = 4.0.
+            k (float): Steepness of the soft-core repulsion. Default = 5.0.
+            r (float): Old scalar parameter representing the uniform contact distance 
+                       (diameter) between any two identical beads. If provided without `radii`, 
+                       all beads share this same interaction distance. Default = 1.0.
+            radii (array-like, optional): Array of individual bead radii. If provided, 
+                       the interaction distance between bead i and bead j will be computed 
+                       dynamically as `r_rep_i + r_rep_j`. This enables heterogeneous 
+                       particle sizes. When this is passed, the scalar parameter `r` is ignored.
+            group (int): Force group for this force. Default = 2.
         """
-        repul_energy = "0.5 * Ecut * (1.0 + tanh((k_rep * (r_rep - r))))"
-        avoidance_force = CustomNonbondedForce(repul_energy)
-        avoidance_force.setForceGroup(group)
-        avoidance_force.setCutoffDistance(self.nonbonded_cutoff)
-        avoidance_force.setNonbondedMethod(self.nonbonded_method)
+        if radii is not None:
+            self.logger.info("Using per-particle 'radii' array. The scalar parameter 'r' will be ignored.")
+            repul_energy = "0.5 * Ecut * (1.0 + tanh((k_rep * (r_rep1 + r_rep2 - r))))"
+            avoidance_force = CustomNonbondedForce(repul_energy)
+            avoidance_force.setForceGroup(group)
+            avoidance_force.setCutoffDistance(self.nonbonded_cutoff)
+            avoidance_force.setNonbondedMethod(self.nonbonded_method)
 
-        avoidance_force.addGlobalParameter("Ecut", Ecut)
-        avoidance_force.addGlobalParameter("r_rep", r)
-        avoidance_force.addGlobalParameter("k_rep", k)
+            avoidance_force.addGlobalParameter("Ecut", Ecut)
+            avoidance_force.addGlobalParameter("k_rep", k)
+            avoidance_force.addPerParticleParameter("r_rep")
 
-        num_particles = getattr(self, "num_particles", self.system.getNumParticles())
-        for _ in range(num_particles):
-            avoidance_force.addParticle(())
+            radii_array = np.asarray(radii, dtype=float)
+            num_particles = getattr(self, "num_particles", self.system.getNumParticles())
+            if len(radii_array) != num_particles:
+                raise ValueError("Length of radii array must match number of particles")
+            
+            for r_val in radii_array:
+                avoidance_force.addParticle([r_val])
+                
+            self.logger.info("Adding Self-avoidance force with parameters:")
+            self.logger.info(
+                f"Ecut={Ecut}, k_rep={k}, radii array (unique: {np.unique(radii_array)}), cutoff={self.nonbonded_cutoff}, group={group}"
+            )
+        else:
+            repul_energy = "0.5 * Ecut * (1.0 + tanh((k_rep * (r_rep - r))))"
+            avoidance_force = CustomNonbondedForce(repul_energy)
+            avoidance_force.setForceGroup(group)
+            avoidance_force.setCutoffDistance(self.nonbonded_cutoff)
+            avoidance_force.setNonbondedMethod(self.nonbonded_method)
 
-        self.logger.info("Adding Self-avoidance force with parameters:")
-        self.logger.info(
-            f"Ecut={Ecut}, k_rep={k}, r_rep={r}, cutoff={self.nonbonded_cutoff}, group={group}"
-        )
+            avoidance_force.addGlobalParameter("Ecut", Ecut)
+            avoidance_force.addGlobalParameter("r_rep", r)
+            avoidance_force.addGlobalParameter("k_rep", k)
+
+            num_particles = getattr(self, "num_particles", self.system.getNumParticles())
+            for _ in range(num_particles):
+                avoidance_force.addParticle(())
+
+            self.logger.info("Adding Self-avoidance force with parameters:")
+            self.logger.info(
+                f"Ecut={Ecut}, k_rep={k}, r={r} (uniform diameter), cutoff={self.nonbonded_cutoff}, group={group}"
+            )
+
         self.register_force(avoidance_force, "SelfAvoidance")
 
     def add_lennard_jones_force(
@@ -521,30 +559,54 @@ class ForceFieldManager:
         )
         self.register_force(wca_force, "WCA")
 
-    def add_LJ_repulsion(self, sigma: float = 1.0, group: int = 6) -> None:
+    def add_LJ_repulsion(self, sigma: float = 1.0, radii: Optional[Union[List[float], np.ndarray]] = None, group: int = 6) -> None:
         """
         Adds hard-core self-avoidance with a simple repulsive Lennard-Jones potential.
 
         Args:
-            sigma (float): LJ sigma parameter. Default = 1.0
+            sigma (float): LJ sigma parameter. Default = 1.0. Used as uniform diameter.
+            radii (array-like, optional): Array of individual bead radii. If provided, `sigma` is ignored.
             group (int): Force group for this force. Default = 6
         """
-        repul_energy = "(sigma / r) ^ 12"
-        hard_repel_force = CustomNonbondedForce(repul_energy)
-        hard_repel_force.setForceGroup(group)
-        hard_repel_force.setCutoffDistance(self.nonbonded_cutoff)
-        hard_repel_force.setNonbondedMethod(self.nonbonded_method)
+        if radii is not None:
+            self.logger.info("Using per-particle 'radii' array. The scalar parameter 'sigma' will be ignored.")
+            repul_energy = "(sigma_LJ / r) ^ 12; sigma_LJ = sigma1 + sigma2"
+            hard_repel_force = CustomNonbondedForce(repul_energy)
+            hard_repel_force.setForceGroup(group)
+            hard_repel_force.setCutoffDistance(self.nonbonded_cutoff)
+            hard_repel_force.setNonbondedMethod(self.nonbonded_method)
 
-        hard_repel_force.addGlobalParameter("sigma", sigma)
+            hard_repel_force.addPerParticleParameter("sigma")
 
-        num_particles = getattr(self, "num_particles", self.system.getNumParticles())
-        for _ in range(num_particles):
-            hard_repel_force.addParticle(())
+            radii_array = np.asarray(radii, dtype=float)
+            num_particles = getattr(self, "num_particles", self.system.getNumParticles())
+            if len(radii_array) != num_particles:
+                raise ValueError("Length of radii array must match number of particles")
 
-        self.logger.info("Adding Hard-core repulsion force with parameters:")
-        self.logger.info(
-            f"sigma={sigma}, cutoff={self.nonbonded_cutoff}, group={group}"
-        )
+            for s_val in radii_array:
+                hard_repel_force.addParticle([s_val])
+
+            self.logger.info("Adding Hard-core repulsion force with parameters:")
+            self.logger.info(
+                f"radii array (unique: {np.unique(radii_array)}), cutoff={self.nonbonded_cutoff}, group={group}"
+            )
+        else:
+            repul_energy = "(sigma / r) ^ 12"
+            hard_repel_force = CustomNonbondedForce(repul_energy)
+            hard_repel_force.setForceGroup(group)
+            hard_repel_force.setCutoffDistance(self.nonbonded_cutoff)
+            hard_repel_force.setNonbondedMethod(self.nonbonded_method)
+
+            hard_repel_force.addGlobalParameter("sigma", sigma)
+
+            num_particles = getattr(self, "num_particles", self.system.getNumParticles())
+            for _ in range(num_particles):
+                hard_repel_force.addParticle(())
+
+            self.logger.info("Adding Hard-core repulsion force with parameters:")
+            self.logger.info(
+                f"sigma={sigma} (uniform diameter), cutoff={self.nonbonded_cutoff}, group={group}"
+            )
 
         self.register_force(hard_repel_force, "HardCoreLJ")
 
