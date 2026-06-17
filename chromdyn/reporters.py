@@ -326,7 +326,7 @@ class EnergyReporter:
             context = simulation.context
             num_particles: int = system.getNumParticles()
             positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometers)
-            Rg: float = Analyzer.compute_RG(positions)
+            Rg: float = Analyzer.compute_RG(positions, print_choice=False)
 
             integrator = simulation.context.getIntegrator()
             if hasattr(integrator, "computeSystemTemperature"):

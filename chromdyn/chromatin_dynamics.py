@@ -127,6 +127,7 @@ class ChromatinDynamics:
         energy_report_interval: int = 1000,
         pos_report_interval: int = 1000,
         force_reinitialize: bool = True,
+        advance_time: bool = False,
     ) -> None:
         """Sets up the integrator, platform, context, and attaches reporters."""
 
@@ -151,6 +152,7 @@ class ChromatinDynamics:
             friction=friction,
             logger=self.logger,
             timestep=timestep,
+            advance_time=advance_time,
         )
 
         self.simulation = Simulation(

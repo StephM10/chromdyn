@@ -245,7 +245,8 @@ class Analyzer:
     def compute_RG(
         positions: np.ndarray, 
         return_components: bool = False,
-        bead_masses: Optional[np.ndarray] = None
+        bead_masses: Optional[np.ndarray] = None,
+        print_choice: bool = True,
     ) -> Union[float, np.ndarray, Tuple]:
         """
         Calculates the Radius of Gyration (Rg).
@@ -262,10 +263,12 @@ class Analyzer:
         # 1. Handle masses and log choice
         if bead_masses is not None:
             masses = np.asarray(bead_masses)
-            print("Computing mass-weighted Radius of Gyration")
+            if print_choice:
+                print("Computing mass-weighted Radius of Gyration")
         else:
             masses = np.ones(positions.shape[-2])
-            print("Computing geometric Radius of Gyration (uniform mass)")
+            if print_choice:
+                print("Computing geometric Radius of Gyration (uniform mass)")
 
         # ---------------------------------------------------------
         # Case 1: Single Frame (N, 3)
@@ -1218,6 +1221,115 @@ class Analyzer:
             return Analyzer._msd_fft_cpu_batch(positions, batch_size)
 
     @staticmethod
+    def compute_msd_average(
+        positions: np.ndarray,
+        bead_types: Optional[np.ndarray] = None,
+        batch_size: int = 100,
+        platform: str = "auto",
+        sampling_step: int = 1,
+    ) -> Dict[str, Union[np.ndarray, Dict[str, np.ndarray], Dict[str, int]]]:
+        """
+        Computes full-lag MSD averages without materializing the full bead-resolved
+        MSD matrix for all beads at once.
+
+        Args:
+            positions: Coordinates with shape (n_frames, n_beads, 3). This may be a
+                normal ndarray or a disk-backed np.memmap returned by Trajectory.xyz.
+            bead_types: Optional 1-D labels with length n_beads. If provided, the
+                return payload includes per-type MSD averages.
+            batch_size: Number of beads to process per FFT batch.
+            platform: 'auto', 'cpu', or 'gpu'.
+            sampling_step: Optional stride along the frame axis.
+
+        Returns:
+            Dictionary with keys:
+                'msd': 1-D average MSD over all beads.
+                'type_msd': dict mapping bead type to 1-D average MSD.
+                'type_counts': dict mapping bead type to bead count.
+        """
+        if not isinstance(positions, np.ndarray):
+            raise TypeError("Input positions must be a numpy.ndarray.")
+        if positions.ndim != 3 or positions.shape[2] != 3:
+            raise ValueError(
+                f"Expected positions shape (n_frames, n_beads, 3), got {positions.shape}"
+            )
+        if not isinstance(sampling_step, int) or sampling_step < 1:
+            raise ValueError("sampling_step must be a positive integer.")
+        if not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer.")
+
+        platform = platform.lower()
+        if platform not in ["auto", "cpu", "gpu"]:
+            raise ValueError("Platform must be 'auto', 'cpu', or 'gpu'.")
+
+        use_gpu = False
+        if platform == "gpu":
+            if CUPY_AVAILABLE:
+                use_gpu = True
+            else:
+                warnings.warn(
+                    "GPU requested but CuPy is not available. Falling back to CPU."
+                )
+        elif platform == "auto":
+            use_gpu = CUPY_AVAILABLE
+
+        positions_sliced = positions[::sampling_step, :, :]
+        n_frames, n_beads, _ = positions_sliced.shape
+
+        if bead_types is not None:
+            bead_types = np.asarray(bead_types)
+            if bead_types.shape[0] != n_beads:
+                raise ValueError(
+                    f"bead_types length ({bead_types.shape[0]}) does not match "
+                    f"number of beads ({n_beads})."
+                )
+
+        total_sum = np.zeros(n_frames, dtype=np.float64)
+        total_count = 0
+        type_sums: Dict[str, np.ndarray] = {}
+        type_counts: Dict[str, int] = {}
+
+        print(
+            f"Computing averaged MSD on {'GPU' if use_gpu else 'CPU'} "
+            f"(Bead batch size: {batch_size})..."
+        )
+
+        for start_idx in range(0, n_beads, batch_size):
+            end_idx = min(start_idx + batch_size, n_beads)
+            coords_batch = positions_sliced[:, start_idx:end_idx, :]
+            if use_gpu:
+                msd_batch = Analyzer._msd_fft_gpu_batch(coords_batch, batch_size)
+            else:
+                msd_batch = Analyzer._msd_fft_cpu_batch(coords_batch, batch_size)
+
+            total_sum += np.sum(msd_batch, axis=1, dtype=np.float64)
+            total_count += msd_batch.shape[1]
+
+            if bead_types is not None:
+                batch_types = bead_types[start_idx:end_idx]
+                for bead_type in np.unique(batch_types):
+                    label = str(bead_type)
+                    mask = batch_types == bead_type
+                    if label not in type_sums:
+                        type_sums[label] = np.zeros(n_frames, dtype=np.float64)
+                        type_counts[label] = 0
+                    type_sums[label] += np.sum(msd_batch[:, mask], axis=1, dtype=np.float64)
+                    type_counts[label] += int(np.sum(mask))
+
+            del msd_batch
+
+        type_msd = {
+            label: type_sum / type_counts[label]
+            for label, type_sum in type_sums.items()
+        }
+
+        return {
+            "msd": total_sum / total_count,
+            "type_msd": type_msd,
+            "type_counts": type_counts,
+        }
+
+    @staticmethod
     def compute_anomalous_dynamics(
         lag_times: np.ndarray, msd: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -1595,14 +1707,38 @@ class Trajectory:
 
         return self
 
-    def xyz(self, frames=[0, None, 1], bead_selection=None, xyz_cols=[0, 1, 2]):
+    def xyz(
+        self,
+        frames=[0, None, 1],
+        bead_selection=None,
+        xyz_cols=[0, 1, 2],
+        frame_batch_size: Optional[int] = None,
+        dtype=None,
+        storage: str = "memory",
+        memmap_path: Optional[str] = None,
+    ):
         """
         Get the selected beads' 3D position from a **cndb** file for multiple frames.
+
+        Args:
+            frames: [start, end, step] frame range.
+            bead_selection: Optional bead indices to retrieve.
+            xyz_cols: Coordinate columns to retrieve.
+            frame_batch_size: Optional number of frames to materialize per read
+                batch. The final return value remains a single array.
+            dtype: Optional output dtype, e.g. np.float32 to reduce memory.
+            storage: 'memory' for a normal ndarray or 'memmap' for a disk-backed
+                array.
+            memmap_path: Required output path when storage='memmap'.
         """
         if self.cndb is None:
             raise RuntimeError("No file loaded. Call load() first.")
 
-        frame_list = []
+        storage = storage.lower()
+        if storage not in {"memory", "memmap"}:
+            raise ValueError("storage must be 'memory' or 'memmap'.")
+        if frame_batch_size is not None and frame_batch_size < 1:
+            raise ValueError("frame_batch_size must be a positive integer.")
 
         if bead_selection is None:
             selection = np.arange(self.n_beads)
@@ -1617,22 +1753,64 @@ class Trajectory:
         start = max(0, start)
         end = min(end, self.n_frames)
 
-        for i in range(start, end, step):
-            try:
-                key = str(i)
-                if key not in self.cndb:
-                    continue
-                frame_data = np.array(self.cndb[key])
-                selected_data = np.take(
-                    np.take(frame_data, selection, axis=0), xyz_cols, axis=1
-                )
-                frame_list.append(selected_data)
-            except KeyError:
-                print(f"Warning: Frame {i} doesn't exist, skipping.")
-            except Exception as e:
-                print(f"Error extracting data from frame {i}: {e}")
+        frame_indices = [i for i in range(start, end, step) if str(i) in self.cndb]
+        if not frame_indices:
+            return np.array([], dtype=dtype)
 
-        return np.array(frame_list)
+        first_frame = np.array(self.cndb[str(frame_indices[0])])
+        first_selected = np.take(
+            np.take(first_frame, selection, axis=0), xyz_cols, axis=1
+        )
+        if dtype is not None:
+            first_selected = first_selected.astype(dtype, copy=False)
+
+        out_shape = (len(frame_indices),) + first_selected.shape
+        out_dtype = first_selected.dtype
+
+        if storage == "memmap":
+            if memmap_path is None:
+                raise ValueError("memmap_path is required when storage='memmap'.")
+            output = np.memmap(memmap_path, dtype=out_dtype, mode="w+", shape=out_shape)
+        elif frame_batch_size is not None or dtype is not None:
+            output = np.empty(out_shape, dtype=out_dtype)
+        else:
+            frame_list = []
+            for i in frame_indices:
+                try:
+                    frame_data = np.array(self.cndb[str(i)])
+                    selected_data = np.take(
+                        np.take(frame_data, selection, axis=0), xyz_cols, axis=1
+                    )
+                    frame_list.append(selected_data)
+                except KeyError:
+                    print(f"Warning: Frame {i} doesn't exist, skipping.")
+                except Exception as e:
+                    print(f"Error extracting data from frame {i}: {e}")
+            return np.array(frame_list)
+
+        batch_size = frame_batch_size or len(frame_indices)
+        for batch_start in range(0, len(frame_indices), batch_size):
+            batch_indices = frame_indices[batch_start : batch_start + batch_size]
+            batch_data = np.empty((len(batch_indices),) + first_selected.shape, dtype=out_dtype)
+            for j, i in enumerate(batch_indices):
+                try:
+                    key = str(i)
+                    frame_data = np.array(self.cndb[key])
+                    selected_data = np.take(
+                        np.take(frame_data, selection, axis=0), xyz_cols, axis=1
+                    )
+                    if dtype is not None:
+                        selected_data = selected_data.astype(dtype, copy=False)
+                    batch_data[j] = selected_data
+                except KeyError:
+                    print(f"Warning: Frame {i} doesn't exist, skipping.")
+                except Exception as e:
+                    print(f"Error extracting data from frame {i}: {e}")
+            output[batch_start : batch_start + len(batch_indices)] = batch_data
+
+        if isinstance(output, np.memmap):
+            output.flush()
+        return output
 
     def close(self):
         """Close the HDF5 file handle."""
