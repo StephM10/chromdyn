@@ -315,12 +315,29 @@ class HiCManager:
                                         to process in each GPU batch for memory efficiency.
                                         If None, processes all frames at once.
         """
-        xyz = self.cndb_to_numpy(traj_file, skip_frames=skip_frames)
-
         if platform.upper() == "CPU" and batch_size is not None:
             self.logger.warning(
                 "`batch_size` is specified but `platform` is 'CPU'. The batching parameter will be ignored."
             )
+
+        if platform.upper() == "CPU":
+            if parallel:
+                self.logger.warning(
+                    "CPU HiC now streams CNDB frames to avoid OOM; multiprocessing is disabled for this path."
+                )
+
+            self.logger.info("Computing HiC serially on CPU with streaming CNDB reads...")
+            hic = self._gen_hic_from_cndb_streaming(
+                traj_file=traj_file,
+                mu=mu,
+                rc=rc,
+                p=p,
+                skip_frames=skip_frames,
+            )
+            self.logger.info(f"Generated HiC matrix of shape: {hic.shape}")
+            return hic
+
+        xyz = self.cndb_to_numpy(traj_file, skip_frames=skip_frames)
 
         if platform.upper() == "CUDA":
             if CUPY_AVAILABLE and cp.cuda.runtime.getDeviceCount() > 0:
@@ -335,46 +352,43 @@ class HiCManager:
                 )
                 platform = "CPU"
 
-        if platform.upper() == "CPU":
-            serialize = not parallel  # Directly use the 'parallel' flag
+        return hic
 
-            if parallel:
+    def _gen_hic_from_cndb_streaming(
+        self,
+        traj_file,
+        mu=2.0,
+        rc=2.0,
+        p=None,
+        skip_frames=1,
+        progress_interval=50000,
+    ):
+        self.logger.info("Streaming trajectory from CNDB ...")
+        with h5py.File(traj_file, "r") as pos:
+            frame_ids = []
+            for val in pos.keys():
                 try:
-                    import multiprocessing
+                    frame_ids.append(int(val))
+                except ValueError:
+                    pass
+            frame_ids = sorted(frame_ids)[::skip_frames]
+            if not frame_ids:
+                raise ValueError(f"No trajectory frames found in {traj_file}")
 
-                    # This logic is now correctly controlled by the 'parallel' parameter
-                    multiprocessing.set_start_method("spawn", force=True)
-                    num_proc = min(
-                        multiprocessing.cpu_count(), 32, 1 + xyz.shape[0] // 10
-                    )
-                    subtraj_list = self._divide_into_subtraj(xyz, num_proc)
+            first_frame = np.asarray(pos[str(frame_ids[0])], dtype=np.float32)
+            n_beads = first_frame.shape[0]
+            hic = np.zeros((n_beads, n_beads), dtype=np.float64)
+
+            for frame_count, frame_id in enumerate(frame_ids, start=1):
+                frame = np.asarray(pos[str(frame_id)], dtype=np.float32)
+                hic += _calc_prob(frame, mu, rc, p)
+                if progress_interval and frame_count % progress_interval == 0:
                     self.logger.info(
-                        f"Using multiprocessing on CPU. Dividing into {num_proc} processes."
+                        f"Streaming HiC progress: {frame_count}/{len(frame_ids)} frames"
                     )
 
-                    args_list = [(subtraj, mu, rc, p) for subtraj in subtraj_list]
-                    hic = np.zeros((xyz.shape[1], xyz.shape[1]), dtype=np.float32)
-
-                    with multiprocessing.Pool(processes=num_proc) as pool:
-                        total_frames = xyz.shape[0]
-                        results = pool.map(_wrap_calc, args_list)
-
-                        for i, subtraj in enumerate(subtraj_list):
-                            hic += results[i] * (subtraj.shape[0] / total_frames)
-
-                    self.logger.info(f"Generated HiC matrix of shape: {hic.shape}")
-
-                except (ModuleNotFoundError, RuntimeError) as e:
-                    self.logger.warning(
-                        f"Multiprocessing failed with error: {e}. Falling back to serial computation."
-                    )
-                    serialize = True
-
-            if serialize:
-                self.logger.info("Computing HiC serially on CPU...")
-                hic = _calc_HiC_from_traj_array(xyz, mu, rc, p)
-                self.logger.info(f"Generated HiC matrix of shape: {hic.shape}")
-
+        hic /= len(frame_ids)
+        self.logger.info(f"Trajectory frames processed: {len(frame_ids)}")
         return hic
 
     # =========================================================================
