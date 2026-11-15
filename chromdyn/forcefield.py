@@ -715,6 +715,7 @@ class ForceFieldManager:
         return type_labels, interaction_matrix
 
     def _initialize_mono_pos_constraint(self, group: int) -> None:
+
         constraint_energy = (
             "0.5 * k_constraint * dist ^ 2 ;"
             "dist = sqrt((x - x_con) ^ 2  + (y - y_con) ^ 2 + (z - z_con) ^ 2)"
@@ -736,6 +737,7 @@ class ForceFieldManager:
         k: float = 50.0,
         group: int = 8,
     ) -> None:
+        # Simulate optical tweezer potential trapping a single monomer
         if "PosConstraint" not in self.forceDict.keys():
             self._initialize_mono_pos_constraint(group)
 
@@ -758,3 +760,55 @@ class ForceFieldManager:
             self._initialize_force_z_axis(group)
 
         self.forceDict["zAxialPull"].addParticle(int(mono_id), [float(fz), float(k_xy)])
+
+    def _initialize_oscillatory_tweezer(self, group: int) -> None:
+        energy = (
+            "0.5 * k_ot * ( (x - (x0 + A * cos(omega * t)))^2 + (y - y0)^2 + (z - z0)^2 )"
+        )
+        tweezer_force = CustomExternalForce(energy)
+        tweezer_force.addGlobalParameter("t", 0.0)
+        tweezer_force.addPerParticleParameter("k_ot")
+        tweezer_force.addPerParticleParameter("A")
+        tweezer_force.addPerParticleParameter("omega")
+        tweezer_force.addPerParticleParameter("x0")
+        tweezer_force.addPerParticleParameter("y0")
+        tweezer_force.addPerParticleParameter("z0")
+        tweezer_force.setForceGroup(group)
+        self.register_force(tweezer_force, "OscillatoryTweezer")
+
+    def apply_oscillatory_tweezer(
+        self,
+        mono_id: int,
+        k_ot: float,
+        A: float,
+        omega: float,
+        pos: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        group: int = 8,
+    ) -> None:
+        """
+        Applies a time-dependent oscillatory optical tweezer potential to a particle.
+        The trap oscillates along the X-axis: x_trap(t) = x0 + A * cos(omega * t).
+
+        Add the force before simulation_setup(). Use advance_time=True with an
+        active integrator to advance the shared Context parameter ``t`` every
+        step, or update ``context.setParameter('t', current_time)`` manually.
+        Parameters use OpenMM internal units: nm, ps, and kJ/mol.
+        """
+        if isinstance(mono_id, (bool, np.bool_)) or not isinstance(mono_id, (int, np.integer)):
+            raise ValueError("mono_id must be an integer particle index")
+        if not 0 <= mono_id < self.num_particles:
+            raise ValueError("mono_id is outside the topology particle range")
+        if not isinstance(group, (int, np.integer)) or not 0 <= group <= 31:
+            raise ValueError("Force group must be an integer between 0 and 31")
+        parameters = np.asarray([k_ot, A, omega, *pos], dtype=float)
+        if parameters.shape != (6,) or not np.all(np.isfinite(parameters)):
+            raise ValueError("Trap parameters must be finite and pos must contain three coordinates")
+        if k_ot < 0:
+            raise ValueError("Trap stiffness k_ot must be nonnegative")
+        if "OscillatoryTweezer" not in self.forceDict.keys():
+            self._initialize_oscillatory_tweezer(group)
+
+        self.forceDict["OscillatoryTweezer"].addParticle(
+            int(mono_id),
+            [float(k_ot), float(A), float(omega), float(pos[0]), float(pos[1]), float(pos[2])],
+        )

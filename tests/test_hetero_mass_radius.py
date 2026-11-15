@@ -11,8 +11,9 @@ def test_hetero_mass_radius(tmp_path):
 
     # 2. Setup masses and radii
     num_particles = sum(chain_lens)
-    masses = np.random.uniform(1.0, 2.0, size=num_particles)
-    radii = np.random.uniform(0.5, 1.0, size=num_particles)
+    rng = np.random.default_rng(2026)
+    masses = rng.uniform(1.0, 2.0, size=num_particles)
+    radii = rng.uniform(0.5, 1.0, size=num_particles)
     sigmas = radii * 2.0  # Just an example
     
     # 3. Initialize Dynamics
@@ -22,6 +23,7 @@ def test_hetero_mass_radius(tmp_path):
         name="test_hetero",
         output_dir=str(tmp_path),
         mass=masses,
+        platform_name="Reference",
         console_stream=False
     )
     
@@ -44,6 +46,8 @@ def test_hetero_mass_radius(tmp_path):
     
     # Take 1 step to ensure everything compiles and runs
     sim.run(n_steps=1, verbose=True, report=False)
+    positions = sim.simulation.context.getState(getPositions=True).getPositions(asNumpy=True)
+    assert np.all(np.isfinite(positions._value))
     
     print("Test passed! Heterogeneous mass and radius correctly executed.")
 

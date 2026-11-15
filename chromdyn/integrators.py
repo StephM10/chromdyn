@@ -6,7 +6,10 @@
 #  * Author: Sumitabha Brahmachari                                               *
 #  * --------------------------------------------------------------------------- *
 
-from openmm import LangevinIntegrator, BrownianIntegrator, CustomIntegrator, Integrator
+import numpy as np
+from openmm import (
+    LangevinIntegrator, BrownianIntegrator, CustomIntegrator, Integrator, Vec3, unit,
+)
 from .utilities import LogManager
 
 
@@ -50,6 +53,11 @@ class IntegratorManager:
             )
             self.friction = kwargs.get("friction", self.DEFAULT_PARAMS["friction"])
             self.timestep = kwargs.get("timestep", self.DEFAULT_PARAMS["timestep"])
+            self.advance_time = kwargs.get("advance_time", False)
+            self.precompute_coefficients = kwargs.get("precompute_coefficients", True)
+            self.store_unconstrained_positions = kwargs.get(
+                "store_unconstrained_positions", False
+            )
 
             self.integrator = self.create_integrator(self.integrator_name)
 
@@ -96,7 +104,7 @@ class IntegratorManager:
                 # self.logger.info("integrator.setPerDofVariableByName('t_corr', [Vec3(t,t,t) for t in tau_list]).")
                 self.is_active = True
                 return ActiveLangevinIntegrator(
-                    self.temperature, self.friction, self.timestep
+                    self.temperature, self.friction, self.timestep, advance_time=self.advance_time
                 )
 
             elif integrator == "active-brownian":
@@ -110,7 +118,12 @@ class IntegratorManager:
                 # self.logger.info("integrator.setPerDofVariableByName('t_corr', [Vec3(t,t,t) for t in tau_list]).")
                 self.is_active = True
                 return ActiveBrownianIntegrator(
-                    self.temperature, self.friction, self.timestep
+                    self.temperature,
+                    self.friction,
+                    self.timestep,
+                    advance_time=self.advance_time,
+                    store_unconstrained_positions=self.store_unconstrained_positions,
+                    precompute_coefficients=self.precompute_coefficients,
                 )
 
         except Exception as e:
@@ -125,9 +138,14 @@ class IntegratorManager:
 
 class ActiveBrownianIntegrator(CustomIntegrator):
     R"""
-    The :class:`~.ActiveBrownianIntegrator` class is a custom Brownian integrator. Just like all Brownian integrators there are no velocities, there are only forces and displacements.
-    Here we use the velocities as a proxy to keep track of the active force for each monomer.
-    Hence velocity v of a monomer represents the active force f = gamma * v.
+    Overdamped Brownian dynamics with a separate per-DOF active OU force ``p``.
+
+    ``precompute_coefficients=True`` caches the OU and Brownian coefficients.
+    Explicit activity, step-size, ``g``, or ``kbT`` setters refresh the cache;
+    ``refresh_coefficients()`` is also available after low-level state changes.
+    Set ``store_unconstrained_positions=True`` to save pre-constraint positions
+    in ``x1``. This optional snapshot is off by default to avoid an extra GPU
+    update kernel; position constraints are applied in either mode.
     """
 
     def __init__(
@@ -137,52 +155,173 @@ class ActiveBrownianIntegrator(CustomIntegrator):
         timestep=0.001,
         corr_time=10.0,
         constraint_tolerance=1e-8,
+        advance_time=False,
+        store_unconstrained_positions=False,
+        precompute_coefficients=True,
     ):
-
-        # Create a new CustomIntegrator
         super().__init__(timestep)
+        self._validate_scalar("timestep", self.getStepSize().value_in_unit(unit.picosecond))
+        self._validate_scalar("friction", collision_rate)
+        self._validate_scalar("correlation time", corr_time)
+        self._validate_scalar("temperature", temperature, allow_zero=True)
+        self.precompute_coefficients = precompute_coefficients
+        self._coefficient_cache_ready = False
 
-        # add global variables
-        kbT = 0.008314 * temperature
-        self.addGlobalVariable("kbT", kbT)
+        # advance_time=True requires a Context parameter 't', typically supplied
+        # by a time-dependent force such as OscillatoryTweezer.
+        self.advance_time_flag = advance_time
+        self.store_unconstrained_positions = store_unconstrained_positions
+        self.addGlobalVariable("kbT", 0.008314 * temperature)
         self.addGlobalVariable("g", collision_rate)
-        # self.addGlobalVariable("t_corr", corr_time)
         self.addPerDofVariable("t_corr", corr_time)
+        self.addPerDofVariable("p", 0)
         self.addPerDofVariable("F_act", 0)
         self.setConstraintTolerance(constraint_tolerance)
-
-        # add attributes
         self.collisionRate = collision_rate
         self.corrTime = corr_time
         self.temperature = temperature
 
-        self.addPerDofVariable("x1", 0)  # for constraints
+        if self.precompute_coefficients:
+            self.addGlobalVariable("bd_drift", 0)
+            self.addGlobalVariable("bd_noise", 0)
+            self.addPerDofVariable("ou_decay", 0)
+            self.addPerDofVariable("ou_noise", 0)
+            self.refresh_coefficients()
+        self._coefficient_cache_ready = True
+
+        self.addPerDofVariable("x1", 0)  # optional pre-constraint snapshot
         self.addUpdateContextState()
+        if self.precompute_coefficients:
+            self.addComputePerDof("p", "ou_decay * p + ou_noise * gaussian")
+            self.addComputePerDof(
+                "x", "x + bd_drift * (f + p) + bd_noise * gaussian"
+            )
+        else:
+            self.addComputePerDof(
+                "p",
+                "exp(-dt / t_corr) * p + sqrt(1 - exp(-2 * dt / t_corr)) * F_act * gaussian",
+            )
+            self.addComputePerDof(
+                "x", "x + dt * (f + p) / g + sqrt(2 * kbT * dt / g) * gaussian"
+            )
+        if self.store_unconstrained_positions:
+            self.addComputePerDof("x1", "x")
+        self.addConstrainPositions()
+        if self.advance_time_flag:
+            self.addComputeGlobal("t", "t + dt")
 
-        # update velocities. note velocities represent the active force and only depend on their value in previous time step
-        # IMPORTANT: the force-group "0" is associated with keeping track of the active noise
-        self.addComputePerDof(
-            "v",
-            "(exp(- dt / t_corr ) * v) + ((sqrt(1 - exp( - 2 * dt / t_corr)) * F_act / g) * gaussian)",
+    def refresh_coefficients(self):
+        """Refresh cached coefficients without changing positions or OU state.
+
+        Normal setters call this automatically. Call it explicitly after
+        bypassing the Python setters to modify the underlying OpenMM object.
+        It is a no-op when precomputation is disabled.
+        """
+        if not self.precompute_coefficients:
+            return
+        dt = self.getStepSize().value_in_unit(unit.picosecond)
+        g = self.getGlobalVariableByName("g")
+        kbT = self.getGlobalVariableByName("kbT")
+        tau = np.asarray(self.getPerDofVariableByName("t_corr"), dtype=float)
+        amplitude = np.asarray(self.getPerDofVariableByName("F_act"), dtype=float)
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError("Brownian timestep must be finite and positive")
+        if not np.isfinite(g) or g <= 0:
+            raise ValueError("Brownian friction g must be finite and positive")
+        if not np.isfinite(kbT) or kbT < 0:
+            raise ValueError("Brownian kbT must be finite and nonnegative")
+        if not np.all(np.isfinite(tau)) or np.any(tau <= 0):
+            raise ValueError("Active correlation times must be finite and positive")
+        if not np.all(np.isfinite(amplitude)):
+            raise ValueError("Active force amplitudes must be finite")
+
+        decay = np.exp(-dt / tau)
+        # expm1 avoids cancellation for the common small-dt/long-tau regime.
+        noise = amplitude * np.sqrt(-np.expm1(-2 * dt / tau))
+        super().setPerDofVariableByName("ou_decay", [Vec3(*row) for row in decay])
+        super().setPerDofVariableByName("ou_noise", [Vec3(*row) for row in noise])
+        super().setGlobalVariableByName("bd_drift", float(dt / g))
+        super().setGlobalVariableByName("bd_noise", float(np.sqrt(2 * kbT * dt / g)))
+
+    def set_activity(self, F_seq, tau_seq):
+        """Set particle activity and refresh once after both inputs are updated."""
+        amplitudes = np.asarray(F_seq, dtype=float)
+        times = np.asarray(tau_seq, dtype=float)
+        if amplitudes.ndim != 1 or times.shape != amplitudes.shape or not times.size:
+            raise ValueError("Activity and correlation times must be nonempty 1D arrays of equal length")
+        self._validate_per_dof_parameter("F_act", amplitudes)
+        self._validate_per_dof_parameter("t_corr", times)
+        super().setPerDofVariableByName(
+            "t_corr", [Vec3(t, t, t) for t in times]
         )
-        self.addConstrainVelocities()
-
-        # compute position update
-        # note that the update computed below *OVER* estimates the contribution from the force-group "0" or the active force
-        # the intended contribution of the active force is in the (v * dt) term, but the (f * dt / g) term also has
-        # the contribution of force-group 0, which needs to be taken out -- as is done in the following line
-        self.addComputePerDof(
-            "x", "x + (v * dt) + (dt * f / g) + (sqrt(2 * (kbT / g) * dt) * gaussian)"
+        super().setPerDofVariableByName(
+            "F_act", [Vec3(f, f, f) for f in amplitudes]
         )
-        # self.addComputePerDof("x", "x - (dt  * F_act / g)")
+        self.refresh_coefficients()
 
-        self.addComputePerDof("x1", "x")  # save pre-constraint positions in x1
-        self.addConstrainPositions()  # x is now constrained
+    @staticmethod
+    def _validate_scalar(name, value, allow_zero=False):
+        if not np.isfinite(value) or (value < 0 if allow_zero else value <= 0):
+            bound = "nonnegative" if allow_zero else "positive"
+            raise ValueError(f"Brownian {name} must be finite and {bound}")
+
+    @staticmethod
+    def _validate_per_dof_parameter(name, values):
+        if name not in {"t_corr", "F_act"}:
+            return
+        values = np.asarray(values, dtype=float)
+        if not np.all(np.isfinite(values)) or (name == "t_corr" and np.any(values <= 0)):
+            raise ValueError(f"{name} must be finite" + (" and positive" if name == "t_corr" else ""))
+
+    def _validate_global_parameter(self, name, value):
+        if name == "g":
+            self._validate_scalar("friction", value)
+        elif name == "kbT":
+            self._validate_scalar("kbT", value, allow_zero=True)
+
+    def _refresh_after_parameter_change(self, name):
+        if (
+            getattr(self, "_coefficient_cache_ready", False)
+            and self.precompute_coefficients
+            and name in {"dt", "g", "kbT", "t_corr", "F_act"}
+        ):
+            self.refresh_coefficients()
+
+    def setStepSize(self, size):
+        value = size.value_in_unit(unit.picosecond) if unit.is_quantity(size) else size
+        self._validate_scalar("timestep", value)
+        super().setStepSize(size)
+        self._refresh_after_parameter_change("dt")
+
+    def setPerDofVariable(self, index, values):
+        self._validate_per_dof_parameter(self.getPerDofVariableName(index), values)
+        super().setPerDofVariable(index, values)
+        self._refresh_after_parameter_change(self.getPerDofVariableName(index))
+
+    def setPerDofVariableByName(self, name, values):
+        self._validate_per_dof_parameter(name, values)
+        super().setPerDofVariableByName(name, values)
+        self._refresh_after_parameter_change(name)
+
+    def setGlobalVariable(self, index, value):
+        self._validate_global_parameter(self.getGlobalVariableName(index), value)
+        super().setGlobalVariable(index, value)
+        self._refresh_after_parameter_change(self.getGlobalVariableName(index))
+
+    def setGlobalVariableByName(self, name, value):
+        self._validate_global_parameter(name, value)
+        super().setGlobalVariableByName(name, value)
+        self._refresh_after_parameter_change(name)
 
 
 class ActiveLangevinIntegrator(CustomIntegrator):
-    def __init__(self, temperature, gamma, dt, corr_time=1.0):
+    def __init__(self, temperature, gamma, dt, corr_time=1.0, advance_time=False):
         super().__init__(dt)
+
+        # WARNING: advance_time=True assumes the Context has a global parameter 't'.
+        # This is typically added by a CustomExternalForce (e.g., OscillatoryTweezer).
+        # If 't' is not defined in any force, OpenMM will raise an Unknown Variable exception.
+        self.advance_time_flag = advance_time
 
         # Globals
         self.addGlobalVariable("kbT", 0.008314 * temperature)  # kJ/mol
@@ -238,3 +377,60 @@ class ActiveLangevinIntegrator(CustomIntegrator):
             "p",
             "exp(-halfdt/t_corr)*p + sqrt(1 - exp(-2*halfdt/t_corr)) * F_act * gaussian",
         )
+
+        # Advance global time at the end of the step
+        if self.advance_time_flag:
+            self.addComputeGlobal("t", "t + dt")
+
+
+class ActiveBrownianIntegratorLegacy(CustomIntegrator):
+    R"""
+    Legacy backup of the original ActiveBrownianIntegrator implementation.
+
+    This version uses the OpenMM state velocity ``v`` as a proxy for active
+    force. It is kept here for reproducibility and comparison with older runs;
+    IntegratorManager does not instantiate it by default.
+    """
+
+    def __init__(
+        self,
+        temperature=120.0,
+        collision_rate=1.0,
+        timestep=0.001,
+        corr_time=10.0,
+        constraint_tolerance=1e-8,
+        advance_time=False,
+    ):
+        super().__init__(timestep)
+
+        self.advance_time_flag = advance_time
+
+        kbT = 0.008314 * temperature
+        self.addGlobalVariable("kbT", kbT)
+        self.addGlobalVariable("g", collision_rate)
+        self.addPerDofVariable("t_corr", corr_time)
+        self.addPerDofVariable("F_act", 0)
+        self.setConstraintTolerance(constraint_tolerance)
+
+        self.collisionRate = collision_rate
+        self.corrTime = corr_time
+        self.temperature = temperature
+
+        self.addPerDofVariable("x1", 0)
+        self.addUpdateContextState()
+
+        self.addComputePerDof(
+            "v",
+            "(exp(- dt / t_corr ) * v) + ((sqrt(1 - exp( - 2 * dt / t_corr)) * F_act / g) * gaussian)",
+        )
+        self.addConstrainVelocities()
+
+        self.addComputePerDof(
+            "x", "x + (v * dt) + (dt * f / g) + (sqrt(2 * (kbT / g) * dt) * gaussian)"
+        )
+
+        self.addComputePerDof("x1", "x")
+        self.addConstrainPositions()
+
+        if self.advance_time_flag:
+            self.addComputeGlobal("t", "t + dt")

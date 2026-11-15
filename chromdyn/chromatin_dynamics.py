@@ -128,8 +128,18 @@ class ChromatinDynamics:
         pos_report_interval: int = 1000,
         force_reinitialize: bool = True,
         advance_time: bool = False,
+        store_unconstrained_positions: bool = False,
+        precompute_coefficients: bool = True,
     ) -> None:
-        """Sets up the integrator, platform, context, and attaches reporters."""
+        """Sets up the integrator, platform, context, and attaches reporters.
+
+        For active Brownian dynamics, ``store_unconstrained_positions`` saves
+        pre-constraint positions in the integrator's ``x1`` variable. It is off
+        by default to avoid an extra GPU update kernel.
+        ``precompute_coefficients`` enables cached active Brownian coefficients
+        by default; explicit activity and integrator parameter setters refresh
+        them automatically.
+        """
 
         # ---- Periodic boundary conditions (optional) ----
         if PBC:
@@ -153,6 +163,8 @@ class ChromatinDynamics:
             logger=self.logger,
             timestep=timestep,
             advance_time=advance_time,
+            store_unconstrained_positions=store_unconstrained_positions,
+            precompute_coefficients=precompute_coefficients,
         )
 
         self.simulation = Simulation(
@@ -246,26 +258,31 @@ class ChromatinDynamics:
             self.logger.info(f"Force-field reporter created: {path}")
 
     def set_activity(self, F_seq: List, tau_seq: List):
+        """Set finite per-particle activity amplitudes and positive correlation times."""
+        if self.simulation is None:
+            raise RuntimeError("Call simulation_setup() before setting activity")
+        if not self.integrator_manager.is_active:
+            raise ValueError("Activity requires an active-brownian or active-langevin integrator")
+        F_seq = np.asarray(F_seq, dtype=float)
+        tau_seq = np.asarray(tau_seq, dtype=float)
+        expected_shape = (self.num_particles,)
+        if F_seq.shape != expected_shape or tau_seq.shape != expected_shape:
+            raise ValueError(f"Activity and correlation times must each have shape {expected_shape}")
+        if not np.all(np.isfinite(F_seq)):
+            raise ValueError("Active force amplitudes must be finite")
+        if not np.all(np.isfinite(tau_seq)) or np.any(tau_seq <= 0):
+            raise ValueError("Active correlation times must be finite and positive")
 
-        assert hasattr(
-            self, "simulation"
-        ), "Simulation object not set up! Call .simulation_setup() first!"
-        assert (
-            self.integrator_manager.is_active
-        ), "Choose active-langevin integrator while setting up simulation."
-        assert (
-            len(F_seq) == self.num_particles
-        ), "F_seq length differs from the number of system particles"
-        assert (
-            len(tau_seq) == self.num_particles
-        ), "tau_seq length differs from the number of system particles"
-
-        self.integrator_manager.integrator.setPerDofVariableByName(
-            "t_corr", [Vec3(t, t, t) for t in tau_seq]
-        )
-        self.integrator_manager.integrator.setPerDofVariableByName(
-            "F_act", [Vec3(xx, xx, xx) for xx in F_seq]
-        )
+        integrator = self.integrator_manager.integrator
+        if hasattr(integrator, "set_activity"):
+            integrator.set_activity(F_seq, tau_seq)
+        else:
+            integrator.setPerDofVariableByName(
+                "t_corr", [Vec3(t, t, t) for t in tau_seq]
+            )
+            integrator.setPerDofVariableByName(
+                "F_act", [Vec3(xx, xx, xx) for xx in F_seq]
+            )
 
         self.logger.info(
             f"Added active force and correlation times for {len(F_seq)} particles."
@@ -312,14 +329,14 @@ class ChromatinDynamics:
         if not report:
             self.pause_reporters()
 
-        start = time.time()
+        start = time.perf_counter()
         try:
             self.simulation.step(n_steps)
         except Exception as e:
             self.logger.error(f"Simulation error: {e}")
             raise
 
-        elapsed = time.time() - start
+        elapsed = max(time.perf_counter() - start, np.finfo(float).eps)
         steps_per_sec = n_steps / elapsed
 
         if verbose:
