@@ -1,9 +1,8 @@
 # chromdyn
 *A Python library for chromosome dynamics simulation and analysis with options to integrate Hi-C data.*
 
-This is Leren Wang's maintained fork of [Sumitabha Brahmachari's chromdyn](https://github.com/s-brahmachari/chromdyn).
-Development takes place on [`update_v_0.2`](https://github.com/StephM10/chromdyn/tree/update_v_0.2).
-The original simulation framework and authorship are retained; this fork extends the analysis, periodic workflows, reporting, and active-dynamics tools.
+The original simulation framework was developed by [Sumitabha Brahmachari](https://github.com/s-brahmachari/chromdyn).
+Leren Wang's development extensions are maintained on [`StephM10/chromdyn:update_v_0.2`](https://github.com/StephM10/chromdyn/tree/update_v_0.2) and extend the analysis, periodic workflows, reporting, and active-dynamics tools.
 
 ## Maintained extensions
 
@@ -30,10 +29,10 @@ It uses **OpenMM** for fast CPU/GPU simulations and includes:
 
 ## Installation
 
-### From the maintained source branch
+### From source
 
 ```
-git clone --branch update_v_0.2 https://github.com/StephM10/chromdyn.git
+git clone https://github.com/s-brahmachari/chromdyn.git
 cd chromdyn
 pip install -e .
 ```
@@ -44,7 +43,13 @@ For visualization and regression tests, install the test extra:
 pip install -e ".[test]"
 ```
 
-The version installed from PyPI may differ from this fork's maintained branch.
+To use Leren's maintained development branch, clone it explicitly before installation:
+
+```bash
+git clone --branch update_v_0.2 https://github.com/StephM10/chromdyn.git
+```
+
+The versions on PyPI, upstream main, and the maintained development branch may differ.
 
 ## Verify Installation
 

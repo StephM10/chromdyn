@@ -40,7 +40,7 @@ Rheology experiment scripts, experiment notebooks, local validation workspaces, 
 
 Upstream history includes merge [`b96abc9`](https://github.com/s-brahmachari/chromdyn/commit/b96abc9), recording PR #2 from `StephM10/update_v_0.2` on 15 January 2026. Some contributions therefore already form part of upstream's history; later fork development is recorded separately on this branch.
 
-The November 2026 consolidation is maintained in `StephM10/chromdyn:update_v_0.2`. No new upstream PR is part of this update.
+The November 2026 consolidation is maintained in `StephM10/chromdyn:update_v_0.2` and included in the existing [upstream PR #3](https://github.com/s-brahmachari/chromdyn/pull/3), originally opened on 3 March 2026. The existing PR is kept open and updated; no additional PR is created. Historical attribution in this document includes work already incorporated through PR #2, while PR #3 has its own current code diff.
 
 ## Validation and claim boundaries
 
