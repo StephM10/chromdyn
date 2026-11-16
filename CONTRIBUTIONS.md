@@ -44,6 +44,8 @@ The November 2026 consolidation is maintained in `StephM10/chromdyn:update_v_0.2
 
 ## Validation and claim boundaries
 
+On 16 November 2026, upstream commit [`f93d40b`](https://github.com/s-brahmachari/chromdyn/commit/f93d40b93770ddbac9b13b37fff32c0650c5ab94), authored by Sumitabha Brahmachari, was merged to incorporate his cylindrical-confinement correction. The axial potential uses `abs(z)` so the positive and negative end caps are symmetric. Nine analytical energy/force cases cover the interior, both caps, radial confinement, and combined radial/axial displacements. These tests maintain the imported fix; the correction itself is attributed to Sumi.
+
 Regression checks cover analytic trap energy/forces, parameter-update behavior, OU one-step statistics, thermal diffusion, cached/uncached integration, independence from state velocity, short-run timing, heterogeneous-particle behavior, and selected trajectory/MSD operations. CUDA comparisons run when CUDA is available. The small effective-interaction notebook is a workflow demonstration, not a convergence or equilibration study.
 
 These checks support the tested numerical behaviors. They do not establish a universal speedup, model accuracy, or scientific novelty. Scientific applications still need model-specific convergence, controls, and parameter justification. Several historical commits explicitly record AI-assisted implementation; Git attribution identifies the maintainer responsible for those changes.

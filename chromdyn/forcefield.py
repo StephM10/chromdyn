@@ -370,7 +370,8 @@ class ForceFieldManager:
     ) -> None:
         """
         Adds a cylindrical confinement potential to the system. Particles are confined within
-        a cylinder defined by radius in the xy-plane and height along z.
+        radius ``r_cyl`` in the xy-plane and half-height ``z_cyl`` along z.
+        The axial confinement vanishes for ``-z_cyl <= z <= z_cyl``.
         """
         self.logger.info("-" * 50)
         self.logger.info("Adding Cylindrical Confinement force:")
