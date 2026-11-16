@@ -27,7 +27,8 @@ try:
     CUPY_AVAILABLE = True
 except ImportError:
     warnings.warn(
-        "Cupy not found. GPU acceleration will not be available. Calculations will be on CPU"
+        "Cupy not found. GPU acceleration not available. Calculations will be on CPU",
+        UserWarning, stacklevel=2
     )
     CUPY_AVAILABLE = False
     cp = None

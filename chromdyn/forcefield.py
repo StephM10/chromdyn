@@ -379,9 +379,9 @@ class ForceFieldManager:
         )
 
         energy_expr = (
-            "step(r_xy - r_cyl) * 0.5 * k_cyl * (r_xy - r_cyl)^2 + "
-            "step(z^2 - z_cyl^2) * 0.5 * k_cyl * (z - z_cyl)^2; "
-            "r_xy = sqrt(x^2 + y^2)"
+            "step(r_xy-r_cyl)*0.5*k_cyl*(r_xy-r_cyl)^2 + "
+            "step(abs(z)-z_cyl)*0.5*k_cyl*(abs(z)-z_cyl)^2; "
+            "r_xy=sqrt(x^2+y^2)"
         )
 
         confinement_force = CustomExternalForce(energy_expr)
