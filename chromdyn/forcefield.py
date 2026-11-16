@@ -370,7 +370,8 @@ class ForceFieldManager:
     ) -> None:
         """
         Adds a cylindrical confinement potential to the system. Particles are confined within
-        a cylinder defined by radius in the xy-plane and height along z.
+        radius ``r_cyl`` in the xy-plane and half-height ``z_cyl`` along z.
+        The axial confinement vanishes for ``-z_cyl <= z <= z_cyl``.
         """
         self.logger.info("-" * 50)
         self.logger.info("Adding Cylindrical Confinement force:")
@@ -379,9 +380,9 @@ class ForceFieldManager:
         )
 
         energy_expr = (
-            "step(r_xy - r_cyl) * 0.5 * k_cyl * (r_xy - r_cyl)^2 + "
-            "step(z^2 - z_cyl^2) * 0.5 * k_cyl * (z - z_cyl)^2; "
-            "r_xy = sqrt(x^2 + y^2)"
+            "step(r_xy-r_cyl)*0.5*k_cyl*(r_xy-r_cyl)^2 + "
+            "step(abs(z)-z_cyl)*0.5*k_cyl*(abs(z)-z_cyl)^2; "
+            "r_xy=sqrt(x^2+y^2)"
         )
 
         confinement_force = CustomExternalForce(energy_expr)
@@ -396,29 +397,67 @@ class ForceFieldManager:
         self.register_force(confinement_force, "CylindricalConfinement")
 
     def add_self_avoidance(
-        self, Ecut: float = 4.0, k: float = 5.0, r: float = 1.0, group: int = 2
+        self, Ecut: float = 4.0, k: float = 5.0, r: float = 1.0, radii: Optional[Union[List[float], np.ndarray]] = None, group: int = 2
     ) -> None:
         """
         Adds soft-core self-avoidance force.
+        
+        Args:
+            Ecut (float): Energy cutoff parameter. Default = 4.0.
+            k (float): Steepness of the soft-core repulsion. Default = 5.0.
+            r (float): Old scalar parameter representing the uniform contact distance 
+                       (diameter) between any two identical beads. If provided without `radii`, 
+                       all beads share this same interaction distance. Default = 1.0.
+            radii (array-like, optional): Array of individual bead radii. If provided, 
+                       the interaction distance between bead i and bead j will be computed 
+                       dynamically as `r_rep_i + r_rep_j`. This enables heterogeneous 
+                       particle sizes. When this is passed, the scalar parameter `r` is ignored.
+            group (int): Force group for this force. Default = 2.
         """
-        repul_energy = "0.5 * Ecut * (1.0 + tanh((k_rep * (r_rep - r))))"
-        avoidance_force = CustomNonbondedForce(repul_energy)
-        avoidance_force.setForceGroup(group)
-        avoidance_force.setCutoffDistance(self.nonbonded_cutoff)
-        avoidance_force.setNonbondedMethod(self.nonbonded_method)
+        if radii is not None:
+            self.logger.info("Using per-particle 'radii' array. The scalar parameter 'r' will be ignored.")
+            repul_energy = "0.5 * Ecut * (1.0 + tanh((k_rep * (r_rep1 + r_rep2 - r))))"
+            avoidance_force = CustomNonbondedForce(repul_energy)
+            avoidance_force.setForceGroup(group)
+            avoidance_force.setCutoffDistance(self.nonbonded_cutoff)
+            avoidance_force.setNonbondedMethod(self.nonbonded_method)
 
-        avoidance_force.addGlobalParameter("Ecut", Ecut)
-        avoidance_force.addGlobalParameter("r_rep", r)
-        avoidance_force.addGlobalParameter("k_rep", k)
+            avoidance_force.addGlobalParameter("Ecut", Ecut)
+            avoidance_force.addGlobalParameter("k_rep", k)
+            avoidance_force.addPerParticleParameter("r_rep")
 
-        num_particles = getattr(self, "num_particles", self.system.getNumParticles())
-        for _ in range(num_particles):
-            avoidance_force.addParticle(())
+            radii_array = np.asarray(radii, dtype=float)
+            num_particles = getattr(self, "num_particles", self.system.getNumParticles())
+            if len(radii_array) != num_particles:
+                raise ValueError("Length of radii array must match number of particles")
+            
+            for r_val in radii_array:
+                avoidance_force.addParticle([r_val])
+                
+            self.logger.info("Adding Self-avoidance force with parameters:")
+            self.logger.info(
+                f"Ecut={Ecut}, k_rep={k}, radii array (unique: {np.unique(radii_array)}), cutoff={self.nonbonded_cutoff}, group={group}"
+            )
+        else:
+            repul_energy = "0.5 * Ecut * (1.0 + tanh((k_rep * (r_rep - r))))"
+            avoidance_force = CustomNonbondedForce(repul_energy)
+            avoidance_force.setForceGroup(group)
+            avoidance_force.setCutoffDistance(self.nonbonded_cutoff)
+            avoidance_force.setNonbondedMethod(self.nonbonded_method)
 
-        self.logger.info("Adding Self-avoidance force with parameters:")
-        self.logger.info(
-            f"Ecut={Ecut}, k_rep={k}, r_rep={r}, cutoff={self.nonbonded_cutoff}, group={group}"
-        )
+            avoidance_force.addGlobalParameter("Ecut", Ecut)
+            avoidance_force.addGlobalParameter("r_rep", r)
+            avoidance_force.addGlobalParameter("k_rep", k)
+
+            num_particles = getattr(self, "num_particles", self.system.getNumParticles())
+            for _ in range(num_particles):
+                avoidance_force.addParticle(())
+
+            self.logger.info("Adding Self-avoidance force with parameters:")
+            self.logger.info(
+                f"Ecut={Ecut}, k_rep={k}, r={r} (uniform diameter), cutoff={self.nonbonded_cutoff}, group={group}"
+            )
+
         self.register_force(avoidance_force, "SelfAvoidance")
 
     def add_lennard_jones_force(
@@ -521,30 +560,54 @@ class ForceFieldManager:
         )
         self.register_force(wca_force, "WCA")
 
-    def add_LJ_repulsion(self, sigma: float = 1.0, group: int = 6) -> None:
+    def add_LJ_repulsion(self, sigma: float = 1.0, radii: Optional[Union[List[float], np.ndarray]] = None, group: int = 6) -> None:
         """
         Adds hard-core self-avoidance with a simple repulsive Lennard-Jones potential.
 
         Args:
-            sigma (float): LJ sigma parameter. Default = 1.0
+            sigma (float): LJ sigma parameter. Default = 1.0. Used as uniform diameter.
+            radii (array-like, optional): Array of individual bead radii. If provided, `sigma` is ignored.
             group (int): Force group for this force. Default = 6
         """
-        repul_energy = "(sigma / r) ^ 12"
-        hard_repel_force = CustomNonbondedForce(repul_energy)
-        hard_repel_force.setForceGroup(group)
-        hard_repel_force.setCutoffDistance(self.nonbonded_cutoff)
-        hard_repel_force.setNonbondedMethod(self.nonbonded_method)
+        if radii is not None:
+            self.logger.info("Using per-particle 'radii' array. The scalar parameter 'sigma' will be ignored.")
+            repul_energy = "(sigma_LJ / r) ^ 12; sigma_LJ = sigma1 + sigma2"
+            hard_repel_force = CustomNonbondedForce(repul_energy)
+            hard_repel_force.setForceGroup(group)
+            hard_repel_force.setCutoffDistance(self.nonbonded_cutoff)
+            hard_repel_force.setNonbondedMethod(self.nonbonded_method)
 
-        hard_repel_force.addGlobalParameter("sigma", sigma)
+            hard_repel_force.addPerParticleParameter("sigma")
 
-        num_particles = getattr(self, "num_particles", self.system.getNumParticles())
-        for _ in range(num_particles):
-            hard_repel_force.addParticle(())
+            radii_array = np.asarray(radii, dtype=float)
+            num_particles = getattr(self, "num_particles", self.system.getNumParticles())
+            if len(radii_array) != num_particles:
+                raise ValueError("Length of radii array must match number of particles")
 
-        self.logger.info("Adding Hard-core repulsion force with parameters:")
-        self.logger.info(
-            f"sigma={sigma}, cutoff={self.nonbonded_cutoff}, group={group}"
-        )
+            for s_val in radii_array:
+                hard_repel_force.addParticle([s_val])
+
+            self.logger.info("Adding Hard-core repulsion force with parameters:")
+            self.logger.info(
+                f"radii array (unique: {np.unique(radii_array)}), cutoff={self.nonbonded_cutoff}, group={group}"
+            )
+        else:
+            repul_energy = "(sigma / r) ^ 12"
+            hard_repel_force = CustomNonbondedForce(repul_energy)
+            hard_repel_force.setForceGroup(group)
+            hard_repel_force.setCutoffDistance(self.nonbonded_cutoff)
+            hard_repel_force.setNonbondedMethod(self.nonbonded_method)
+
+            hard_repel_force.addGlobalParameter("sigma", sigma)
+
+            num_particles = getattr(self, "num_particles", self.system.getNumParticles())
+            for _ in range(num_particles):
+                hard_repel_force.addParticle(())
+
+            self.logger.info("Adding Hard-core repulsion force with parameters:")
+            self.logger.info(
+                f"sigma={sigma} (uniform diameter), cutoff={self.nonbonded_cutoff}, group={group}"
+            )
 
         self.register_force(hard_repel_force, "HardCoreLJ")
 
@@ -653,6 +716,7 @@ class ForceFieldManager:
         return type_labels, interaction_matrix
 
     def _initialize_mono_pos_constraint(self, group: int) -> None:
+
         constraint_energy = (
             "0.5 * k_constraint * dist ^ 2 ;"
             "dist = sqrt((x - x_con) ^ 2  + (y - y_con) ^ 2 + (z - z_con) ^ 2)"
@@ -674,6 +738,7 @@ class ForceFieldManager:
         k: float = 50.0,
         group: int = 8,
     ) -> None:
+        # Simulate optical tweezer potential trapping a single monomer
         if "PosConstraint" not in self.forceDict.keys():
             self._initialize_mono_pos_constraint(group)
 
@@ -696,3 +761,55 @@ class ForceFieldManager:
             self._initialize_force_z_axis(group)
 
         self.forceDict["zAxialPull"].addParticle(int(mono_id), [float(fz), float(k_xy)])
+
+    def _initialize_oscillatory_tweezer(self, group: int) -> None:
+        energy = (
+            "0.5 * k_ot * ( (x - (x0 + A * cos(omega * t)))^2 + (y - y0)^2 + (z - z0)^2 )"
+        )
+        tweezer_force = CustomExternalForce(energy)
+        tweezer_force.addGlobalParameter("t", 0.0)
+        tweezer_force.addPerParticleParameter("k_ot")
+        tweezer_force.addPerParticleParameter("A")
+        tweezer_force.addPerParticleParameter("omega")
+        tweezer_force.addPerParticleParameter("x0")
+        tweezer_force.addPerParticleParameter("y0")
+        tweezer_force.addPerParticleParameter("z0")
+        tweezer_force.setForceGroup(group)
+        self.register_force(tweezer_force, "OscillatoryTweezer")
+
+    def apply_oscillatory_tweezer(
+        self,
+        mono_id: int,
+        k_ot: float,
+        A: float,
+        omega: float,
+        pos: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        group: int = 8,
+    ) -> None:
+        """
+        Applies a time-dependent oscillatory optical tweezer potential to a particle.
+        The trap oscillates along the X-axis: x_trap(t) = x0 + A * cos(omega * t).
+
+        Add the force before simulation_setup(). Use advance_time=True with an
+        active integrator to advance the shared Context parameter ``t`` every
+        step, or update ``context.setParameter('t', current_time)`` manually.
+        Parameters use OpenMM internal units: nm, ps, and kJ/mol.
+        """
+        if isinstance(mono_id, (bool, np.bool_)) or not isinstance(mono_id, (int, np.integer)):
+            raise ValueError("mono_id must be an integer particle index")
+        if not 0 <= mono_id < self.num_particles:
+            raise ValueError("mono_id is outside the topology particle range")
+        if not isinstance(group, (int, np.integer)) or not 0 <= group <= 31:
+            raise ValueError("Force group must be an integer between 0 and 31")
+        parameters = np.asarray([k_ot, A, omega, *pos], dtype=float)
+        if parameters.shape != (6,) or not np.all(np.isfinite(parameters)):
+            raise ValueError("Trap parameters must be finite and pos must contain three coordinates")
+        if k_ot < 0:
+            raise ValueError("Trap stiffness k_ot must be nonnegative")
+        if "OscillatoryTweezer" not in self.forceDict.keys():
+            self._initialize_oscillatory_tweezer(group)
+
+        self.forceDict["OscillatoryTweezer"].addParticle(
+            int(mono_id),
+            [float(k_ot), float(A), float(omega), float(pos[0]), float(pos[1]), float(pos[2])],
+        )

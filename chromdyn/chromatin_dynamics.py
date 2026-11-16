@@ -18,7 +18,7 @@ from .platforms import PlatformManager
 from .integrators import IntegratorManager
 from .forcefield import ForceFieldManager
 from .utilities import config_generator, LogManager
-from .reporters import SaveStructure, StabilityReporter, EnergyReporter
+from .reporters import SaveStructure, StabilityReporter, EnergyReporter, ForceFieldReporter
 from typing import Optional, Tuple, List, Dict, Union, Any
 
 
@@ -35,7 +35,7 @@ class ChromatinDynamics:
         platform_name: str = "CUDA",
         output_dir: str = "output",
         console_stream: bool = True,
-        mass: float = 1.0,
+        mass: Union[float, List[float], NDArray] = 1.0,
         write_logs: bool = True,
     ) -> None:
 
@@ -60,8 +60,32 @@ class ChromatinDynamics:
         self.topology = topology
         self.system = System()
         self.num_particles = topology.getNumAtoms()
-        for _ in range(self.num_particles):
-            self.system.addParticle(mass)
+        
+        # Handle scalar or array-like mass
+        if np.isscalar(mass):
+            self.masses = np.full(self.num_particles, float(mass))
+        else:
+            self.masses = np.asarray(mass, dtype=float)
+            if len(self.masses) != self.num_particles:
+                raise ValueError(f"Length of mass array ({len(self.masses)}) must match num_particles ({self.num_particles})")
+
+        # Optional: check mass consistency for atom types in topology
+        atom_types_dict = {}
+        for idx, atom in enumerate(self.topology.atoms()):
+            atype = atom.element
+            if atype not in atom_types_dict:
+                atom_types_dict[atype] = []
+            atom_types_dict[atype].append(self.masses[idx])
+
+        for atype, m_list in atom_types_dict.items():
+            if len(set(m_list)) > 1:
+                self.logger.warning(
+                    f"Atom type '{atype}' has inconsistent masses: {np.unique(m_list)}"
+                )
+
+        # Add particles to the system
+        for m in self.masses:
+            self.system.addParticle(float(m))
 
         self.logger.info(
             f"System initialized with {self.num_particles} particles. Output directory: {self.output_dir}"
@@ -97,13 +121,25 @@ class ChromatinDynamics:
         friction: float = 0.1,
         save_pos: bool = True,
         save_energy: bool = True,
+        save_forcefield: bool = True,
         stability_check: bool = True,
         stability_report_interval: int = 500,
         energy_report_interval: int = 1000,
         pos_report_interval: int = 1000,
         force_reinitialize: bool = True,
+        advance_time: bool = False,
+        store_unconstrained_positions: bool = False,
+        precompute_coefficients: bool = True,
     ) -> None:
-        """Sets up the integrator, platform, context, and attaches reporters."""
+        """Sets up the integrator, platform, context, and attaches reporters.
+
+        For active Brownian dynamics, ``store_unconstrained_positions`` saves
+        pre-constraint positions in the integrator's ``x1`` variable. It is off
+        by default to avoid an extra GPU update kernel.
+        ``precompute_coefficients`` enables cached active Brownian coefficients
+        by default; explicit activity and integrator parameter setters refresh
+        them automatically.
+        """
 
         # ---- Periodic boundary conditions (optional) ----
         if PBC:
@@ -126,6 +162,9 @@ class ChromatinDynamics:
             friction=friction,
             logger=self.logger,
             timestep=timestep,
+            advance_time=advance_time,
+            store_unconstrained_positions=store_unconstrained_positions,
+            precompute_coefficients=precompute_coefficients,
         )
 
         self.simulation = Simulation(
@@ -202,31 +241,55 @@ class ChromatinDynamics:
             self.simulation.reporters.append(self.reporters["stability"])
             self.logger.info(f"Stability reporter created: {path}")
 
+        if save_forcefield and self.output_dir is not None:
+            path = self.output_dir / f"{self.name}_forcefield.txt"
+            self.reporters["forcefield"] = ForceFieldReporter(
+                path,
+                force_field_manager=self.force_field_manager,
+                integrator_manager=self.integrator_manager,
+                system_info={
+                    "name": self.name,
+                    "num_particles": self.num_particles,
+                    "mass": self.masses,
+                    "PBC": PBC,
+                    "box_vectors": box_vectors,
+                },
+            )
+            self.logger.info(f"Force-field reporter created: {path}")
+
     def set_activity(self, F_seq: List, tau_seq: List):
+        """Set finite per-particle activity amplitudes and positive correlation times."""
+        if self.simulation is None:
+            raise RuntimeError("Call simulation_setup() before setting activity")
+        if not self.integrator_manager.is_active:
+            raise ValueError("Activity requires an active-brownian or active-langevin integrator")
+        F_seq = np.asarray(F_seq, dtype=float)
+        tau_seq = np.asarray(tau_seq, dtype=float)
+        expected_shape = (self.num_particles,)
+        if F_seq.shape != expected_shape or tau_seq.shape != expected_shape:
+            raise ValueError(f"Activity and correlation times must each have shape {expected_shape}")
+        if not np.all(np.isfinite(F_seq)):
+            raise ValueError("Active force amplitudes must be finite")
+        if not np.all(np.isfinite(tau_seq)) or np.any(tau_seq <= 0):
+            raise ValueError("Active correlation times must be finite and positive")
 
-        assert hasattr(
-            self, "simulation"
-        ), "Simulation object not set up! Call .simulation_setup() first!"
-        assert (
-            self.integrator_manager.is_active
-        ), "Choose active-langevin integrator while setting up simulation."
-        assert (
-            len(F_seq) == self.num_particles
-        ), "F_seq length differs from the number of system particles"
-        assert (
-            len(tau_seq) == self.num_particles
-        ), "tau_seq length differs from the number of system particles"
-
-        self.integrator_manager.integrator.setPerDofVariableByName(
-            "t_corr", [Vec3(t, t, t) for t in tau_seq]
-        )
-        self.integrator_manager.integrator.setPerDofVariableByName(
-            "F_act", [Vec3(xx, xx, xx) for xx in F_seq]
-        )
+        integrator = self.integrator_manager.integrator
+        if hasattr(integrator, "set_activity"):
+            integrator.set_activity(F_seq, tau_seq)
+        else:
+            integrator.setPerDofVariableByName(
+                "t_corr", [Vec3(t, t, t) for t in tau_seq]
+            )
+            integrator.setPerDofVariableByName(
+                "F_act", [Vec3(xx, xx, xx) for xx in F_seq]
+            )
 
         self.logger.info(
             f"Added active force and correlation times for {len(F_seq)} particles."
         )
+
+        if "forcefield" in self.reporters:
+            self.reporters["forcefield"].update_activity(F_seq, tau_seq)
 
     def get_active_params(self, mono_id: int = None) -> Dict[str, Any]:
         assert (
@@ -266,14 +329,14 @@ class ChromatinDynamics:
         if not report:
             self.pause_reporters()
 
-        start = time.time()
+        start = time.perf_counter()
         try:
             self.simulation.step(n_steps)
         except Exception as e:
             self.logger.error(f"Simulation error: {e}")
             raise
 
-        elapsed = time.time() - start
+        elapsed = max(time.perf_counter() - start, np.finfo(float).eps)
         steps_per_sec = n_steps / elapsed
 
         if verbose:

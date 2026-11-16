@@ -27,7 +27,8 @@ try:
     CUPY_AVAILABLE = True
 except ImportError:
     warnings.warn(
-        "Cupy not found. GPU acceleration will not be available. Calculations will be on CPU"
+        "Cupy not found. GPU acceleration not available. Calculations will be on CPU",
+        UserWarning, stacklevel=2
     )
     CUPY_AVAILABLE = False
     cp = None
@@ -41,6 +42,99 @@ class Analyzer:
     - Writhe along a trajectory
     - Radius of gyration (RG)
     """
+
+    @staticmethod
+    def _empty_persistent_length_fit() -> dict:
+        """Return a consistent payload for fits without valid uncertainty."""
+        return {
+            'Lp': np.nan,
+            'Lp_se': np.nan,
+            'Lp_ci95': (np.nan, np.nan),
+            'fit_slope': np.nan,
+            'fit_slope_se': np.nan,
+            'fit_cov': np.array([[np.nan]]),
+            'fit_n_points': 0,
+            'r_squared': np.nan,
+        }
+
+    @staticmethod
+    def _fit_persistent_length_from_corr(
+        tangent_corr: np.ndarray,
+        mean_bond_length: float,
+        min_fit_points: int = 10,
+        corr_threshold: float = 0.01,
+    ) -> dict:
+        """
+        Fit persistent length from tangent correlation and propagate fit uncertainty.
+
+        The fit uses the existing zero-intercept log-linear model:
+        ``log(C(s)) = slope * s`` and ``Lp = -mean_bond_length / slope``.
+        The returned covariance is one-dimensional because only ``slope`` is
+        fitted.
+        """
+        tangent_corr = np.asarray(tangent_corr)
+        s_vals = np.arange(len(tangent_corr))
+        valid = (~np.isnan(tangent_corr)) & (tangent_corr > corr_threshold)
+        if len(valid) > 0:
+            valid[0] = False
+
+        result = Analyzer._empty_persistent_length_fit()
+        n_fit = int(np.sum(valid))
+        result['fit_n_points'] = n_fit
+
+        if n_fit < 2:
+            return result
+
+        log_C = np.log(tangent_corr[valid])
+        s_fit = s_vals[valid]
+        x_sq_sum = np.dot(s_fit, s_fit)
+        if x_sq_sum <= 0:
+            return result
+
+        slope = np.dot(s_fit, log_C) / x_sq_sum
+        result['fit_slope'] = slope
+
+        if not np.isfinite(slope):
+            return result
+
+        if slope >= 0:
+            return result
+
+        Lp = -mean_bond_length / slope
+        y_pred = slope * s_fit
+        residuals = log_C - y_pred
+        ss_res = np.sum(residuals**2)
+        ss_tot = np.sum((log_C - np.mean(log_C))**2)
+        if ss_tot > 0:
+            r_squared = 1 - (ss_res / ss_tot)
+        else:
+            r_squared = 1.0
+
+        dof = n_fit - 1
+        slope_var = np.nan
+        slope_se = np.nan
+        Lp_se = np.nan
+        Lp_ci95 = (np.nan, np.nan)
+        if dof > 0:
+            residual_var = ss_res / dof
+            if np.isfinite(residual_var):
+                slope_var = residual_var / x_sq_sum
+                if slope_var >= 0:
+                    slope_se = np.sqrt(slope_var)
+                    Lp_se = abs(mean_bond_length / (slope**2)) * slope_se
+                    Lp_ci95 = (Lp - 1.96 * Lp_se, Lp + 1.96 * Lp_se)
+
+        result.update(
+            {
+                'Lp': Lp,
+                'Lp_se': Lp_se,
+                'Lp_ci95': Lp_ci95,
+                'fit_slope_se': slope_se,
+                'fit_cov': np.array([[slope_var]]),
+                'r_squared': r_squared,
+            }
+        )
+        return result
 
     @staticmethod
     def _segment_solid_angle(
@@ -150,7 +244,10 @@ class Analyzer:
 
     @staticmethod
     def compute_RG(
-        positions: np.ndarray, return_components: bool = False
+        positions: np.ndarray, 
+        return_components: bool = False,
+        bead_masses: Optional[np.ndarray] = None,
+        print_choice: bool = True,
     ) -> Union[float, np.ndarray, Tuple]:
         """
         Calculates the Radius of Gyration (Rg).
@@ -159,24 +256,35 @@ class Analyzer:
             positions: Coordinates array of shape (N, 3) or (T, N, 3).
             return_components: If True, returns a tuple (rg_total, rg_xyz).
                                rg_xyz will contain [rg_x, rg_y, rg_z].
+            bead_masses: Optional array of bead masses for mass-weighted Rg.
         """
         # receive traj.xyz() as positions
         positions = np.asarray(positions)
+
+        # 1. Handle masses and log choice
+        if bead_masses is not None:
+            masses = np.asarray(bead_masses)
+            if print_choice:
+                print("Computing mass-weighted Radius of Gyration")
+        else:
+            masses = np.ones(positions.shape[-2])
+            if print_choice:
+                print("Computing geometric Radius of Gyration (uniform mass)")
 
         # ---------------------------------------------------------
         # Case 1: Single Frame (N, 3)
         # ---------------------------------------------------------
         if positions.ndim == 2:
             # 1. Calculate Center of Mass
-            center_of_mass = np.mean(positions, axis=0)
+            center_of_mass = np.average(positions, axis=0, weights=masses)
 
             # 2. Calculate squared deviations for each dimension (x, y, z) separately
             # Shape remains (N, 3) here
             sq_deviations = (positions - center_of_mass) ** 2
 
-            # 3. Mean over particles (N) to get squared Rg components
+            # 3. Average over particles (N) to get squared Rg components
             # Shape becomes (3,) -> [Rgx^2, Rgy^2, Rgz^2]
-            rg_sq_components = np.mean(sq_deviations, axis=0)
+            rg_sq_components = np.average(sq_deviations, axis=0, weights=masses)
 
             # 4. Calculate Total Rg
             # Rg = sqrt(Rgx^2 + Rgy^2 + Rgz^2)
@@ -194,15 +302,15 @@ class Analyzer:
         elif positions.ndim == 3:
             # 1. Calculate Centers of Mass
             # Shape (T, 3)
-            centers_of_mass = np.mean(positions, axis=1)
+            centers_of_mass = np.average(positions, axis=1, weights=masses)
 
             # 2. Calculate squared deviations
             # Use broadcasting: (T, N, 3) - (T, 1, 3)
             sq_deviations = (positions - centers_of_mass[:, None, :]) ** 2
 
-            # 3. Mean over particles (axis 1) to get squared Rg components
+            # 3. Average over particles (axis 1) to get squared Rg components
             # Shape becomes (T, 3)
-            rg_sq_components = np.mean(sq_deviations, axis=1)
+            rg_sq_components = np.average(sq_deviations, axis=1, weights=masses)
 
             # 4. Calculate Total Rg per frame
             # Sum over xyz (axis 1 of the component array), then sqrt
@@ -219,6 +327,269 @@ class Analyzer:
             raise ValueError(
                 f"positions must have shape (N, 3) or (T, N, 3), got {positions.shape}"
             )
+
+    @staticmethod
+    def compute_tangent_correlation(
+        positions: np.ndarray,
+        max_s: Optional[int] = None,
+        bond_indices: Optional[np.ndarray] = None,
+        device: str = 'gpu',
+        box_vectors: Optional[np.ndarray] = None,
+    ) -> dict:
+        R"""
+        Compute the tangent-tangent correlation function and estimate persistent length.
+
+        The tangent correlation function is defined as:
+            C(s) = <û_i · û_{i+s}>
+        where û_i is the unit tangent (bond) vector between bead i and i+1,
+        and s is the bond index separation.
+
+        For a Worm-Like Chain (WLC) model, C(s) = exp(-s·b / Lp),
+        where b is the mean bond length and Lp is the persistent length.
+
+        Parameters
+        ----------
+        positions : np.ndarray
+            Coordinates array of shape (N, 3) for a single frame,
+            or (T, N, 3) for a trajectory.
+        max_s : int, optional
+            Maximum bond separation to compute.  If ``None``, determined
+            automatically from two competing constraints:
+
+            - **Upper bound** (noise): ``int(n_bonds * NOISE_FRAC)`` where
+              ``NOISE_FRAC = 0.5``.  At larger separations, too few tangent
+              pairs contribute per C(s) value → noisy.
+            - **Lower bound** (fit quality): ``MIN_FIT_POINTS = 10``.
+              Fewer data points make the exponential fit unreliable.
+
+            If upper < lower, the segment is too short for a robust Lp
+            estimate; C(s) is still computed up to the upper bound but
+            ``fit_reliable`` is set to ``False``.
+
+            A hard cap of 200 is always applied for computational cost.
+        bond_indices : np.ndarray, optional
+            If provided, only these bond indices (into the full bond array)
+            are used. This allows computing tangent correlations for a
+            *subset* of bonds (e.g., within a contiguous type segment).
+            Bond index i corresponds to the vector r_{i+1} - r_i.
+        device : str, default ``'gpu'``
+            Compute backend.  ``'gpu'`` uses CuPy for accelerated
+            bond-vector / dot-product computation (requires CuPy).
+            The final Lp fit is always performed on CPU.
+        box_vectors : np.ndarray, optional
+            Periodic box vectors to apply Minimum Image Convention (MIC)
+            for bond vectors. Shape ``(3,)``, ``(3, 3)``, or ``(T, 3, 3)``.
+
+        Returns
+        -------
+        dict
+            'tangent_corr'    : np.ndarray of shape (max_s + 1,)
+                                C(s) for s = 0, 1, ..., max_s.  C(0) = 1.
+            'contour_length'  : np.ndarray of shape (max_s + 1,)
+                                Cumulative contour distance = s * mean_bond_length.
+            'Lp'              : float or np.nan
+                                Fitted persistent length (units of position).
+            'Lp_se'           : float or np.nan
+                                Fit-based standard error of ``Lp`` from
+                                covariance propagation.
+            'Lp_ci95'         : tuple of float
+                                Approximate 95% confidence interval for ``Lp``.
+            'mean_bond_length': float
+                                Average bond length over all selected bonds/frames.
+            'fit_reliable'    : bool
+                                ``True`` if max_s >= MIN_FIT_POINTS, i.e. enough
+                                data points were available for a robust fit.
+            'r_squared'       : float or np.nan
+                                Coefficient of determination (R^2) for the fit.
+            'fit_slope'       : float or np.nan
+                                Fitted zero-intercept slope of ``log(C(s))`` vs ``s``.
+            'fit_slope_se'    : float or np.nan
+                                Standard error of ``fit_slope``.
+            'fit_cov'         : np.ndarray
+                                One-by-one covariance matrix for ``fit_slope``.
+            'fit_n_points'    : int
+                                Number of positive correlation points used for fitting.
+            'fit_details'     : str
+                                Detailed reason for the reliability status.
+        """
+        positions = np.asarray(positions)
+
+        # ---- Unify to (T, N, 3) ----
+        if positions.ndim == 2:
+            positions = positions[np.newaxis, :, :]  # (1, N, 3)
+        elif positions.ndim != 3:
+            raise ValueError(
+                f"positions must have shape (N, 3) or (T, N, 3), got {positions.shape}"
+            )
+
+        # ---- Select compute backend ----
+        use_gpu = (device.lower() == 'gpu')
+        if use_gpu and not CUPY_AVAILABLE:
+            print("CuPy not available. Falling back to CPU.")
+            use_gpu = False
+        xp = cp if use_gpu else np
+
+        # Transfer to device
+        positions_d = xp.asarray(positions)
+
+        # ---- Bond vectors & unit tangents ----
+        # bond_vectors[:, i, :] = positions[:, i+1, :] - positions[:, i, :]
+        all_bond_vectors = positions_d[:, 1:, :] - positions_d[:, :-1, :]  # (T, N-1, 3)
+
+        # ---- Apply Minimum Image Convention (MIC) if box provided ----
+        if box_vectors is not None:
+            box_d = xp.asarray(box_vectors)
+            if box_d.ndim == 3:
+                # (T, 3, 3) -> diagonal -> (T, 1, 3)
+                box_diag = xp.diagonal(box_d, axis1=1, axis2=2)[:, xp.newaxis, :]
+            elif box_d.ndim == 1:
+                # (3,) -> (1, 1, 3)
+                box_diag = box_d[xp.newaxis, xp.newaxis, :]
+            elif box_d.ndim == 2 and box_d.shape == (3, 3):
+                # (3, 3) -> (1, 1, 3)
+                box_diag = xp.diagonal(box_d)[:, xp.newaxis, :]
+            else:
+                raise ValueError("box_vectors must be (3,), (3, 3), or (T, 3, 3)")
+            
+            # MIC: delta = delta - box_diag * round(delta / box_diag)
+            all_bond_vectors -= box_diag * xp.round(all_bond_vectors / box_diag)
+
+        all_bond_lengths = xp.linalg.norm(
+            all_bond_vectors, axis=-1, keepdims=True
+        )  # (T, N-1, 1)
+
+        # Avoid division by zero for degenerate bonds
+        safe_lengths = xp.where(all_bond_lengths > 0, all_bond_lengths, 1.0)
+        all_unit_tangents = all_bond_vectors / safe_lengths  # (T, N-1, 3)
+
+        # ---- Subset selection ----
+        if bond_indices is not None:
+            bond_indices_np = np.asarray(bond_indices)
+            # For segment-based computation, bond_indices must be *contiguous*
+            # so that index separations still correspond to chain separations.
+            if use_gpu:
+                bi = cp.asarray(bond_indices_np)
+            else:
+                bi = bond_indices_np
+            unit_tangents = all_unit_tangents[:, bi, :]       # (T, M, 3)
+            bond_lengths_sel = all_bond_lengths[:, bi, 0]     # (T, M)
+        else:
+            unit_tangents = all_unit_tangents
+            bond_lengths_sel = all_bond_lengths[:, :, 0]
+
+        n_bonds = unit_tangents.shape[1]  # M
+
+        # ---- Determine max_s: dual-bound logic ----
+        # Upper bound (noise): don't exceed this fraction of n_bonds so that
+        #   each C(s) is averaged over enough tangent pairs.
+        # Lower bound (fit):   need at least this many s-values for a
+        #   reliable exponential fit of ln C(s).
+        NOISE_FRAC = 0.5
+        MIN_FIT_POINTS = 10
+        GLOBAL_CAP = 200  # absolute cap for computational cost
+
+        max_s_from_noise = max(1, int(n_bonds * NOISE_FRAC))
+
+        if max_s is None:
+            max_s = min(max_s_from_noise, GLOBAL_CAP)
+        else:
+            # User-specified: only apply the hard physical limit
+            max_s = min(max_s, n_bonds - 1)
+
+        # Can we meet the fit-quality requirement?
+        fit_reliable = (max_s >= MIN_FIT_POINTS)
+
+        if max_s < 1:
+            # Not enough bonds to compute any correlation
+            mean_bl = float(xp.mean(bond_lengths_sel))
+            if use_gpu:
+                del positions_d, all_bond_vectors, all_bond_lengths
+                del safe_lengths, all_unit_tangents, unit_tangents, bond_lengths_sel
+                cp.get_default_memory_pool().free_all_blocks()
+            return {
+                'tangent_corr': np.array([1.0]),
+                'contour_length': np.array([0.0]),
+                'mean_bond_length': mean_bl,
+                'fit_reliable': False,
+                'fit_details': "Segment too short to compute correlation.",
+                **Analyzer._empty_persistent_length_fit(),
+            }
+
+        mean_bond_length = float(xp.mean(bond_lengths_sel))
+
+        # ---- Tangent correlation C(s) ----
+        tangent_corr_d = xp.zeros(max_s + 1)
+        tangent_corr_d[0] = 1.0  # C(0) = <û · û> = 1
+
+        for s in range(1, max_s + 1):
+            # Dot products for all valid pairs and all frames
+            dots = xp.sum(
+                unit_tangents[:, :n_bonds - s, :] * unit_tangents[:, s:, :],
+                axis=-1,
+            )  # (T, n_bonds - s)
+            tangent_corr_d[s] = xp.mean(dots)
+
+        # ---- Transfer result to CPU for fitting ----
+        if use_gpu:
+            tangent_corr = cp.asnumpy(tangent_corr_d)
+            # Free GPU memory
+            del positions_d, all_bond_vectors, all_bond_lengths
+            del safe_lengths, all_unit_tangents, unit_tangents
+            del bond_lengths_sel, tangent_corr_d
+            cp.get_default_memory_pool().free_all_blocks()
+        else:
+            tangent_corr = np.asarray(tangent_corr_d)
+
+        # ---- Fit persistent length via log-linear regression (CPU) ----
+        # C(s) = exp(-s * b / Lp)  =>  ln C(s) = -(b / Lp) * s
+        s_vals = np.arange(max_s + 1)
+        contour_length = s_vals * mean_bond_length
+
+        fit_details = ""
+        if not fit_reliable:
+            fit_details = f"Segment too short (max_s={max_s} < {MIN_FIT_POINTS}). "
+
+        if max_s >= 1 and tangent_corr[1] <= 0:
+            fit_reliable = False
+            fit_details += (
+                "C(1) <= 0: Chain exhibits local anti-correlation or strong "
+                "flexibility. WLC model is inapplicable."
+            )
+
+        fit_result = Analyzer._fit_persistent_length_from_corr(
+            tangent_corr,
+            mean_bond_length=mean_bond_length,
+            min_fit_points=MIN_FIT_POINTS,
+        )
+
+        if fit_result['fit_n_points'] < 2:
+            if fit_reliable:
+                fit_reliable = False
+                fit_details += "Not enough positive C(s) data points for fitting."
+        elif not np.isfinite(fit_result['Lp']):
+            if fit_reliable:
+                fit_reliable = False
+                fit_details += "Persistent length fit produced a non-finite result."
+        elif fit_result['fit_slope'] >= 0:
+            if fit_reliable:
+                fit_reliable = False
+                fit_details += "Non-decaying correlation (slope >= 0)."
+        elif fit_reliable and fit_result['r_squared'] < 0.8:
+            fit_reliable = False
+            fit_details += f"Poor exponential fit (R^2 = {fit_result['r_squared']:.2f})."
+
+        if fit_reliable and not fit_details:
+            fit_details = "Fit is reliable."
+
+        return {
+            'tangent_corr': tangent_corr,
+            'contour_length': contour_length,
+            'mean_bond_length': mean_bond_length,
+            'fit_reliable': fit_reliable,
+            'fit_details': fit_details.strip(),
+            **fit_result,
+        }
+
 
     @staticmethod
     def wrap_coordinates(positions: np.ndarray, box_vectors: np.ndarray) -> np.ndarray:
@@ -851,6 +1222,115 @@ class Analyzer:
             return Analyzer._msd_fft_cpu_batch(positions, batch_size)
 
     @staticmethod
+    def compute_msd_average(
+        positions: np.ndarray,
+        bead_types: Optional[np.ndarray] = None,
+        batch_size: int = 100,
+        platform: str = "auto",
+        sampling_step: int = 1,
+    ) -> Dict[str, Union[np.ndarray, Dict[str, np.ndarray], Dict[str, int]]]:
+        """
+        Computes full-lag MSD averages without materializing the full bead-resolved
+        MSD matrix for all beads at once.
+
+        Args:
+            positions: Coordinates with shape (n_frames, n_beads, 3). This may be a
+                normal ndarray or a disk-backed np.memmap returned by Trajectory.xyz.
+            bead_types: Optional 1-D labels with length n_beads. If provided, the
+                return payload includes per-type MSD averages.
+            batch_size: Number of beads to process per FFT batch.
+            platform: 'auto', 'cpu', or 'gpu'.
+            sampling_step: Optional stride along the frame axis.
+
+        Returns:
+            Dictionary with keys:
+                'msd': 1-D average MSD over all beads.
+                'type_msd': dict mapping bead type to 1-D average MSD.
+                'type_counts': dict mapping bead type to bead count.
+        """
+        if not isinstance(positions, np.ndarray):
+            raise TypeError("Input positions must be a numpy.ndarray.")
+        if positions.ndim != 3 or positions.shape[2] != 3:
+            raise ValueError(
+                f"Expected positions shape (n_frames, n_beads, 3), got {positions.shape}"
+            )
+        if not isinstance(sampling_step, int) or sampling_step < 1:
+            raise ValueError("sampling_step must be a positive integer.")
+        if not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer.")
+
+        platform = platform.lower()
+        if platform not in ["auto", "cpu", "gpu"]:
+            raise ValueError("Platform must be 'auto', 'cpu', or 'gpu'.")
+
+        use_gpu = False
+        if platform == "gpu":
+            if CUPY_AVAILABLE:
+                use_gpu = True
+            else:
+                warnings.warn(
+                    "GPU requested but CuPy is not available. Falling back to CPU."
+                )
+        elif platform == "auto":
+            use_gpu = CUPY_AVAILABLE
+
+        positions_sliced = positions[::sampling_step, :, :]
+        n_frames, n_beads, _ = positions_sliced.shape
+
+        if bead_types is not None:
+            bead_types = np.asarray(bead_types)
+            if bead_types.shape[0] != n_beads:
+                raise ValueError(
+                    f"bead_types length ({bead_types.shape[0]}) does not match "
+                    f"number of beads ({n_beads})."
+                )
+
+        total_sum = np.zeros(n_frames, dtype=np.float64)
+        total_count = 0
+        type_sums: Dict[str, np.ndarray] = {}
+        type_counts: Dict[str, int] = {}
+
+        print(
+            f"Computing averaged MSD on {'GPU' if use_gpu else 'CPU'} "
+            f"(Bead batch size: {batch_size})..."
+        )
+
+        for start_idx in range(0, n_beads, batch_size):
+            end_idx = min(start_idx + batch_size, n_beads)
+            coords_batch = positions_sliced[:, start_idx:end_idx, :]
+            if use_gpu:
+                msd_batch = Analyzer._msd_fft_gpu_batch(coords_batch, batch_size)
+            else:
+                msd_batch = Analyzer._msd_fft_cpu_batch(coords_batch, batch_size)
+
+            total_sum += np.sum(msd_batch, axis=1, dtype=np.float64)
+            total_count += msd_batch.shape[1]
+
+            if bead_types is not None:
+                batch_types = bead_types[start_idx:end_idx]
+                for bead_type in np.unique(batch_types):
+                    label = str(bead_type)
+                    mask = batch_types == bead_type
+                    if label not in type_sums:
+                        type_sums[label] = np.zeros(n_frames, dtype=np.float64)
+                        type_counts[label] = 0
+                    type_sums[label] += np.sum(msd_batch[:, mask], axis=1, dtype=np.float64)
+                    type_counts[label] += int(np.sum(mask))
+
+            del msd_batch
+
+        type_msd = {
+            label: type_sum / type_counts[label]
+            for label, type_sum in type_sums.items()
+        }
+
+        return {
+            "msd": total_sum / total_count,
+            "type_msd": type_msd,
+            "type_counts": type_counts,
+        }
+
+    @staticmethod
     def compute_anomalous_dynamics(
         lag_times: np.ndarray, msd: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -1228,14 +1708,38 @@ class Trajectory:
 
         return self
 
-    def xyz(self, frames=[0, None, 1], bead_selection=None, xyz_cols=[0, 1, 2]):
+    def xyz(
+        self,
+        frames=[0, None, 1],
+        bead_selection=None,
+        xyz_cols=[0, 1, 2],
+        frame_batch_size: Optional[int] = None,
+        dtype=None,
+        storage: str = "memory",
+        memmap_path: Optional[str] = None,
+    ):
         """
         Get the selected beads' 3D position from a **cndb** file for multiple frames.
+
+        Args:
+            frames: [start, end, step] frame range.
+            bead_selection: Optional bead indices to retrieve.
+            xyz_cols: Coordinate columns to retrieve.
+            frame_batch_size: Optional number of frames to materialize per read
+                batch. The final return value remains a single array.
+            dtype: Optional output dtype, e.g. np.float32 to reduce memory.
+            storage: 'memory' for a normal ndarray or 'memmap' for a disk-backed
+                array.
+            memmap_path: Required output path when storage='memmap'.
         """
         if self.cndb is None:
             raise RuntimeError("No file loaded. Call load() first.")
 
-        frame_list = []
+        storage = storage.lower()
+        if storage not in {"memory", "memmap"}:
+            raise ValueError("storage must be 'memory' or 'memmap'.")
+        if frame_batch_size is not None and frame_batch_size < 1:
+            raise ValueError("frame_batch_size must be a positive integer.")
 
         if bead_selection is None:
             selection = np.arange(self.n_beads)
@@ -1250,22 +1754,64 @@ class Trajectory:
         start = max(0, start)
         end = min(end, self.n_frames)
 
-        for i in range(start, end, step):
-            try:
-                key = str(i)
-                if key not in self.cndb:
-                    continue
-                frame_data = np.array(self.cndb[key])
-                selected_data = np.take(
-                    np.take(frame_data, selection, axis=0), xyz_cols, axis=1
-                )
-                frame_list.append(selected_data)
-            except KeyError:
-                print(f"Warning: Frame {i} doesn't exist, skipping.")
-            except Exception as e:
-                print(f"Error extracting data from frame {i}: {e}")
+        frame_indices = [i for i in range(start, end, step) if str(i) in self.cndb]
+        if not frame_indices:
+            return np.array([], dtype=dtype)
 
-        return np.array(frame_list)
+        first_frame = np.array(self.cndb[str(frame_indices[0])])
+        first_selected = np.take(
+            np.take(first_frame, selection, axis=0), xyz_cols, axis=1
+        )
+        if dtype is not None:
+            first_selected = first_selected.astype(dtype, copy=False)
+
+        out_shape = (len(frame_indices),) + first_selected.shape
+        out_dtype = first_selected.dtype
+
+        if storage == "memmap":
+            if memmap_path is None:
+                raise ValueError("memmap_path is required when storage='memmap'.")
+            output = np.memmap(memmap_path, dtype=out_dtype, mode="w+", shape=out_shape)
+        elif frame_batch_size is not None or dtype is not None:
+            output = np.empty(out_shape, dtype=out_dtype)
+        else:
+            frame_list = []
+            for i in frame_indices:
+                try:
+                    frame_data = np.array(self.cndb[str(i)])
+                    selected_data = np.take(
+                        np.take(frame_data, selection, axis=0), xyz_cols, axis=1
+                    )
+                    frame_list.append(selected_data)
+                except KeyError:
+                    print(f"Warning: Frame {i} doesn't exist, skipping.")
+                except Exception as e:
+                    print(f"Error extracting data from frame {i}: {e}")
+            return np.array(frame_list)
+
+        batch_size = frame_batch_size or len(frame_indices)
+        for batch_start in range(0, len(frame_indices), batch_size):
+            batch_indices = frame_indices[batch_start : batch_start + batch_size]
+            batch_data = np.empty((len(batch_indices),) + first_selected.shape, dtype=out_dtype)
+            for j, i in enumerate(batch_indices):
+                try:
+                    key = str(i)
+                    frame_data = np.array(self.cndb[key])
+                    selected_data = np.take(
+                        np.take(frame_data, selection, axis=0), xyz_cols, axis=1
+                    )
+                    if dtype is not None:
+                        selected_data = selected_data.astype(dtype, copy=False)
+                    batch_data[j] = selected_data
+                except KeyError:
+                    print(f"Warning: Frame {i} doesn't exist, skipping.")
+                except Exception as e:
+                    print(f"Error extracting data from frame {i}: {e}")
+            output[batch_start : batch_start + len(batch_indices)] = batch_data
+
+        if isinstance(output, np.memmap):
+            output.flush()
+        return output
 
     def close(self):
         """Close the HDF5 file handle."""
@@ -1427,6 +1973,372 @@ class Trajectory:
                     results[key_name] = rg_data
 
         return results
+
+    def compute_persistent_length_type(
+        self,
+        custom_types: Optional[List] = None,
+        max_bond_sep: Optional[int] = None,
+        boundary_mode: str = 'segment',
+        device: str = 'gpu',
+        use_pbc: bool = True,
+        positions: Optional[np.ndarray] = None,
+        box_vectors: Optional[np.ndarray] = None,
+    ):
+        R"""
+        Compute persistent length (Lp) classified by particle type.
+
+        Follows the same pattern as ``compute_rg_type``.  Returns the tangent
+        correlation function C(s) and the fitted Lp for the whole chain
+        (``'general'``) and for each bead-type separately.
+
+        Persistent length is extracted from the tangent-tangent correlation:
+            C(s) = <û_i · û_{i+s}>  ≈  exp(-s·b / Lp)
+        where b is the mean bond length.
+
+        Parameters
+        ----------
+        custom_types : list, optional
+            A list of custom bead types.  If provided, used instead of
+            ``self.chrom_seq``.
+        max_bond_sep : int, optional
+            Maximum bond-index separation *s* to compute.  ``None`` lets the
+            ``Analyzer`` auto-select using dual-bound logic:
+
+            - **Upper bound**: ``int(n_bonds * 0.5)`` — caps at half the
+              segment length so each C(s) is averaged over enough pairs.
+            - **Lower bound**: ``10`` data points minimum for a reliable
+              exponential fit.
+
+            When these bounds are incompatible (segment too short), C(s) is
+            still computed but ``fit_reliable`` is ``False`` and Lp may be
+            unreliable.
+        device : str, default ``'gpu'``
+            Compute backend passed to ``Analyzer.compute_tangent_correlation``.
+            ``'gpu'`` uses CuPy for acceleration (requires CuPy).
+        use_pbc : bool, default ``True``
+            If ``True`` and box vectors are available, apply the Minimum Image
+            Convention (MIC) when calculating bond vectors.
+        positions : np.ndarray, optional
+            Pre-loaded positions array of shape ``(T, N, 3)``. If ``None``, calls
+            ``self.xyz()``. Useful for providing concatenated coordinates from
+            multiple replicas.
+        box_vectors : np.ndarray, optional
+            Pre-loaded box vectors. If ``None``, uses ``self.box_vectors``. Useful
+            when providing concatenated coordinates.
+        boundary_mode : str, default ``'segment'``
+            How to handle type boundaries when computing per-type Lp.
+
+            ``'segment'`` (default)
+                For each type, find *contiguous* segments of that type along
+                the chain.  Tangent correlations are computed strictly within
+                each segment.  Bonds at the segment boundaries are included.
+
+            ``'exclude_boundary'``
+                Same as ``'segment'``, but additionally **removes** the first
+                and last bond of each segment if the segment does not sit at
+                the chain terminus.  This avoids any influence from the
+                junction between different types.
+
+            ``'include_boundary'``
+                A bond is assigned to type X if **at least one** of its two
+                endpoint beads has type X.  Tangent correlations for type X
+                are then computed only between bonds that are both assigned to
+                X **and** form a contiguous sub-sequence.
+
+        Returns
+        -------
+        results : dict
+            Keys are ``'general'`` and each unique type name (e.g. ``'A'``,
+            ``'B'``).  Each value is a dict containing:
+
+            - ``'tangent_corr'``    : np.ndarray, shape (max_s+1,) — C(s)
+            - ``'contour_length'``  : np.ndarray, shape (max_s+1,) — s × ⟨b⟩
+            - ``'Lp'``              : float — fitted persistent length
+            - ``'Lp_se'``           : float — fit-based standard error of Lp
+            - ``'Lp_ci95'``         : tuple — approximate 95% confidence interval
+            - ``'mean_bond_length'``: float — average bond length for that subset
+            - ``'fit_reliable'``    : bool — whether enough points for robust fit
+            - ``'r_squared'``       : float — R^2 value of the fit
+            - ``'fit_slope'``       : float — zero-intercept log-linear slope
+            - ``'fit_slope_se'``    : float — standard error of ``fit_slope``
+            - ``'fit_cov'``         : np.ndarray — covariance matrix for slope
+            - ``'fit_n_points'``    : int — number of points used in the fit
+            - ``'fit_details'``     : str — details of fit reliability
+
+        Notes
+        -----
+        For heterogeneous chains (e.g. A-B copolymer), the *general* result
+        uses ALL bonds regardless of type, while each type entry only uses
+        the bonds *within* contiguous segments of that type (subject to
+        ``boundary_mode``).  Segments with fewer than ``2 * MIN_FIT_POINTS``
+        bonds (= 20 by default, after boundary trimming) are skipped since
+        the dual-bound constraints cannot both be satisfied.
+        """
+
+        # ============================================================
+        # 1. Load coordinates & types
+        # ============================================================
+        if positions is not None:
+            all_positions = np.asarray(positions)
+        else:
+            all_positions = np.asarray(
+                self.xyz(frames=[0, None, 1], bead_selection=None)
+            )  # (T, N, 3)
+
+        source_box = box_vectors if box_vectors is not None else self.box_vectors
+        box_to_use = source_box if use_pbc else None
+
+        if custom_types is not None:
+            print("Notice: Using custom-defined bead types for Lp calculation.")
+            bead_types = np.asarray(custom_types)
+        else:
+            bead_types = np.asarray(self.chrom_seq)
+
+        n_beads = all_positions.shape[1]
+        if bead_types.shape[0] != n_beads:
+            raise ValueError(
+                f"bead_types length ({bead_types.shape[0]}) must match "
+                f"number of beads in trajectory ({n_beads})"
+            )
+
+        # ============================================================
+        # 2. 'general' — whole chain
+        # ============================================================
+        results = {}
+        results['general'] = Analyzer.compute_tangent_correlation(
+            all_positions,
+            max_s=max_bond_sep,
+            device=device,
+            box_vectors=box_to_use,
+        )
+
+        # ============================================================
+        # 3. Per-type computation
+        # ============================================================
+        unique_types = np.unique(bead_types)
+
+        if len(unique_types) <= 1:
+            # Homogeneous chain — nothing extra to compute
+            return results
+
+        for t_type in unique_types:
+            key_name = str(t_type)
+
+            # --- Determine bond indices for this type ---
+            segments = self._find_contiguous_segments(bead_types, t_type)
+
+            # Convert bead-level segments to bond-level index lists
+            bond_index_lists = []
+            for seg_start, seg_end in segments:
+                # Bonds in this segment: indices [seg_start, seg_end - 2]
+                # (bond i connects bead i to bead i+1)
+                seg_n_beads = seg_end - seg_start
+                if seg_n_beads < 2:
+                    continue  # need at least 2 beads for 1 bond
+
+                b_start = seg_start
+                b_end = seg_end - 1  # exclusive, bond indices
+
+                # --- Apply boundary_mode trimming ---
+                if boundary_mode == 'exclude_boundary':
+                    # Trim first bond if not at chain start
+                    if seg_start > 0:
+                        b_start += 1
+                    # Trim last bond if not at chain end
+                    if seg_end < n_beads:
+                        b_end -= 1
+                elif boundary_mode == 'include_boundary':
+                    # Extend to include bonds at boundaries (one endpoint matches)
+                    # Left boundary: bond (seg_start - 1) if exists
+                    if seg_start > 0:
+                        b_start -= 1
+                    # Right boundary: bond (seg_end - 1) if exists and < n_beads - 1
+                    if seg_end < n_beads:
+                        b_end += 1
+                elif boundary_mode != 'segment':
+                    raise ValueError(
+                        f"Unknown boundary_mode '{boundary_mode}'. "
+                        f"Choose from 'segment', 'exclude_boundary', 'include_boundary'."
+                    )
+
+                if b_end > b_start:
+                    bond_index_lists.append(np.arange(b_start, b_end))
+
+            if not bond_index_lists:
+                # No valid segments for this type
+                results[key_name] = {
+                    'tangent_corr': np.array([1.0]),
+                    'contour_length': np.array([0.0]),
+                    'mean_bond_length': np.nan,
+                    'fit_reliable': False,
+                    'fit_details': "No valid segments.",
+                    **Analyzer._empty_persistent_length_fit(),
+                }
+                continue
+
+            # --- Compute tangent correlation per segment, then aggregate ---
+            # Strategy: for each contiguous segment, compute C(s) using the
+            #           static method with bond_indices, then weight-average
+            #           across segments by the number of contributing pairs.
+            #
+            # Segment skip criterion:
+            #   A segment with n_bonds bonds yields max_s = n_bonds * 0.5.
+            #   For fit_reliable, we need max_s >= MIN_FIT_POINTS (=10).
+            #   Therefore: n_bonds >= 2 * MIN_FIT_POINTS (=20).
+            #   Shorter segments are skipped to avoid unreliable Lp.
+            MIN_SEG_BONDS = 20  # = 2 * MIN_FIT_POINTS used in Analyzer
+            seg_results = []
+            seg_weights = []  # weight = number of bonds in segment
+
+            for bond_idx in bond_index_lists:
+                seg_len = len(bond_idx)
+                if seg_len < MIN_SEG_BONDS:
+                    continue  # too short for both noise and fit constraints
+
+                seg_res = Analyzer.compute_tangent_correlation(
+                    all_positions,
+                    max_s=max_bond_sep,
+                    bond_indices=bond_idx,
+                    device=device,
+                    box_vectors=box_to_use,
+                )
+                seg_results.append(seg_res)
+                seg_weights.append(seg_len)
+
+            if not seg_results:
+                results[key_name] = {
+                    'tangent_corr': np.array([1.0]),
+                    'contour_length': np.array([0.0]),
+                    'mean_bond_length': np.nan,
+                    'fit_reliable': False,
+                    'fit_details': "All segments too short.",
+                    **Analyzer._empty_persistent_length_fit(),
+                }
+                continue
+
+            # Weighted average of tangent correlation across segments
+            # Pad shorter C(s) arrays with NaN, then do weighted nanmean
+            max_len = max(len(r['tangent_corr']) for r in seg_results)
+            weights_arr = np.array(seg_weights, dtype=float)
+
+            combined_corr = np.full((len(seg_results), max_len), np.nan)
+            for idx, r in enumerate(seg_results):
+                L = len(r['tangent_corr'])
+                combined_corr[idx, :L] = r['tangent_corr']
+
+            # Weighted nanmean along axis 0
+            # For each s, average only over segments that have a value
+            avg_corr = np.zeros(max_len)
+            for s_idx in range(max_len):
+                valid_mask = ~np.isnan(combined_corr[:, s_idx])
+                if np.any(valid_mask):
+                    w = weights_arr[valid_mask]
+                    avg_corr[s_idx] = np.average(
+                        combined_corr[valid_mask, s_idx], weights=w
+                    )
+                else:
+                    avg_corr[s_idx] = np.nan
+
+            # Weighted-average mean bond length
+            mean_bl = np.average(
+                [r['mean_bond_length'] for r in seg_results],
+                weights=weights_arr,
+            )
+
+            # Re-fit Lp from the aggregated C(s)
+            s_vals = np.arange(max_len)
+            contour_length = s_vals * mean_bl
+
+            # Assess reliability based on aggregated correlation
+            MIN_FIT_POINTS = 10
+            fit_reliable = (max_len - 1 >= MIN_FIT_POINTS) # max_len is max_s + 1
+            fit_details = ""
+            if not fit_reliable:
+                fit_details = f"Aggregated max_s={max_len - 1} < {MIN_FIT_POINTS}. "
+
+            if max_len > 1 and avg_corr[1] <= 0:
+                fit_reliable = False
+                fit_details += (
+                    "C(1) <= 0: Chain exhibits local anti-correlation or strong "
+                    "flexibility. WLC model is inapplicable."
+                )
+
+            fit_result = Analyzer._fit_persistent_length_from_corr(
+                avg_corr,
+                mean_bond_length=mean_bl,
+                min_fit_points=MIN_FIT_POINTS,
+            )
+
+            if fit_result['fit_n_points'] < 2:
+                if fit_reliable:
+                    fit_reliable = False
+                    fit_details += "Not enough positive C(s) data points for fitting."
+            elif not np.isfinite(fit_result['Lp']):
+                if fit_reliable:
+                    fit_reliable = False
+                    fit_details += "Persistent length fit produced a non-finite result."
+            elif fit_result['fit_slope'] >= 0:
+                if fit_reliable:
+                    fit_reliable = False
+                    fit_details += "Non-decaying correlation (slope >= 0)."
+            elif fit_reliable and fit_result['r_squared'] < 0.8:
+                fit_reliable = False
+                fit_details += f"Poor exponential fit (R^2 = {fit_result['r_squared']:.2f})."
+
+            # Aggregated fit_reliable: also check if any individual segment failed to be reliable
+            all_reliable = all(r['fit_reliable'] for r in seg_results)
+            if fit_reliable and not all_reliable:
+                fit_reliable = False
+                fit_details += "Some individual segments were unreliable."
+
+            if fit_reliable and not fit_details:
+                fit_details = "Fit is reliable."
+
+            results[key_name] = {
+                'tangent_corr': avg_corr,
+                'contour_length': contour_length,
+                'mean_bond_length': mean_bl,
+                'fit_reliable': fit_reliable,
+                'fit_details': fit_details.strip(),
+                **fit_result,
+            }
+
+        return results
+
+    @staticmethod
+    def _find_contiguous_segments(
+        bead_types: np.ndarray, target_type
+    ) -> List[Tuple[int, int]]:
+        """
+        Find contiguous runs of *target_type* in a 1-D type array.
+
+        Parameters
+        ----------
+        bead_types : np.ndarray
+            1-D array of bead type labels.
+        target_type : str or comparable
+            The type to search for.
+
+        Returns
+        -------
+        list of (start, end)
+            Each tuple gives the **bead** index range [start, end) of a
+            contiguous segment of *target_type*.
+        """
+        mask = (bead_types == target_type)
+        segments = []
+        in_seg = False
+        start = 0
+        for i, val in enumerate(mask):
+            if val and not in_seg:
+                start = i
+                in_seg = True
+            elif not val and in_seg:
+                segments.append((start, i))
+                in_seg = False
+        if in_seg:
+            segments.append((start, len(mask)))
+        return segments
 
     def xyz_wrapped(self, frames=[0, None, 1], bead_selection=None, xyz_cols=[0, 1, 2]):
         """

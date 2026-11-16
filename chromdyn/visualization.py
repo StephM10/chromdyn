@@ -468,9 +468,17 @@ def visualize(
         bbox = ax.get_window_extent()
         if bbox and data_range > 0:
             points_per_unit = (bbox.width * 72 / fig.get_dpi()) / data_range
-            s_phys = np.clip(np.pi * ((r * points_per_unit) ** 2), 0.01, 50000)
+            r_arr = np.asarray(r) if hasattr(r, '__iter__') else np.array(r)
+            s_phys = np.clip(np.pi * ((r_arr * points_per_unit) ** 2), 0.01, 50000)
+            
+            global_idx = 0
             for sc in scatter_collections:
-                sc.set_sizes(np.full(len(sc.get_offsets()), s_phys))
+                n_beads = len(sc.get_offsets())
+                if s_phys.ndim > 0 and s_phys.size > 1:
+                    sc.set_sizes(s_phys[global_idx : global_idx + n_beads])
+                    global_idx += n_beads
+                else:
+                    sc.set_sizes(np.full(n_beads, float(s_phys)))
 
     # --- 10. Output & Display ---
     if output_name:
@@ -745,11 +753,18 @@ def visualize_animation(
 
             # Area formula: pi * radius^2
             # We clip it to avoid extremely small or large markers causing render issues
-            s_phys = np.clip(np.pi * ((r * ppt) ** 2), 0.01, 50000)
+            r_arr = np.asarray(r) if hasattr(r, '__iter__') else np.array(r)
+            s_phys = np.clip(np.pi * ((r_arr * ppt) ** 2), 0.01, 50000)
             s_val = s_phys
-            print(
-                f"Calculated physical marker size: {s_val:.2f} points^2 (for r={r} nm)"
-            )
+            
+            if s_phys.ndim > 0 and s_phys.size > 1:
+                print(
+                    f"Calculated {s_phys.size} physical marker sizes (min: {np.min(s_phys):.2f}, max: {np.max(s_phys):.2f})"
+                )
+            else:
+                print(
+                    f"Calculated physical marker size: {float(s_phys):.2f} points^2 (for r={r} nm)"
+                )
 
     # --- 6. Graphics Initialization ---
     scat = ax.scatter([], [], [], s=s_val, depthshade=True)
@@ -1209,22 +1224,32 @@ def visualize_pbc_images(
         fig.canvas.draw()  # Force render to get transforms
         data_range = max(x_max - x_min, y_max - y_min, z_max - z_min)
         bbox = ax.get_window_extent()
-
         if bbox and data_range > 0:
             points_per_unit = (bbox.width * 72 / fig.get_dpi()) / data_range
-            # Calculate physical area (s is area in points^2)
-            s_phys = np.pi * ((r * points_per_unit) ** 2)
-            s_phys = np.clip(s_phys, 0.01, 50000)
+            r_arr = np.asarray(r) if hasattr(r, '__iter__') else np.array(r)
+            s_phys = np.clip(np.pi * ((r_arr * points_per_unit) ** 2), 0.01, 50000)
 
-            # Apply to Central (Full Size)
+            # Apply to Central
+            global_idx = 0
             for sc in central_scatters:
-                sc.set_sizes(np.full(len(sc.get_offsets()), s_phys))
+                n_beads = len(sc.get_offsets())
+                if s_phys.ndim > 0 and s_phys.size > 1:
+                    sc.set_sizes(s_phys[global_idx : global_idx + n_beads])
+                    global_idx = (global_idx + n_beads) % s_phys.size
+                else:
+                    sc.set_sizes(np.full(n_beads, float(s_phys)))
 
             # Apply to Images (Scaled Down for visual clarity)
             # Factor 0.4 means radius is ~63% of central, looks good for "background"
             s_image = s_phys * 0.4
+            global_idx = 0
             for sc in image_scatters:
-                sc.set_sizes(np.full(len(sc.get_offsets()), s_image))
+                n_beads = len(sc.get_offsets())
+                if s_image.ndim > 0 and s_image.size > 1:
+                    sc.set_sizes(s_image[global_idx : global_idx + n_beads])
+                    global_idx = (global_idx + n_beads) % s_image.size
+                else:
+                    sc.set_sizes(np.full(n_beads, float(s_image)))
     else:
         # Default size if r is not provided
         for sc in central_scatters:
