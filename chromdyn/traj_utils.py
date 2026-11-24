@@ -216,6 +216,13 @@ class Analyzer:
         result = (omega_star / (4.0 * np.pi)) * sign
         return np.where(valid, result, 0.0)
 
+    @staticmethod
+    def _finite_writhe_coordinates(coords):
+        coords = np.asarray(coords)
+        if not np.all(np.isfinite(coords)):
+            raise ValueError("Writhe coordinates must be finite")
+        return coords
+
     @classmethod
     def _compute_writhe_single_curve_legacy(
         cls,
@@ -278,6 +285,7 @@ class Analyzer:
         closed: bool = True,
         method: str = "vectorized",
     ) -> float:
+        coords = cls._finite_writhe_coordinates(coords)
         if method == "vectorized":
             return cls._compute_writhe_single_curve_vectorized(coords, closed=closed)
         if method == "legacy":
@@ -360,6 +368,8 @@ class Analyzer:
         float
             The computed writhe between the two curves.
         """
+        curve1 = cls._finite_writhe_coordinates(curve1)
+        curve2 = cls._finite_writhe_coordinates(curve2)
         if method == "vectorized":
             return cls._compute_writhe_between_curves_vectorized(curve1, curve2)
         if method == "legacy":
@@ -376,6 +386,7 @@ class Analyzer:
     ) -> List[float]:
         if method not in {"vectorized", "legacy"}:
             raise ValueError("method must be 'vectorized' or 'legacy'")
+        trajectory = cls._finite_writhe_coordinates(trajectory)
         if processes is None:
             processes = max(cpu_count() - 1, 1)
 
@@ -1044,12 +1055,10 @@ class Analyzer:
 
         if n_beads >= 2 and n_pairs > 0 and dist_range > 0:
             for frame_idx in range(0, n_frames, sampling_step):
-                if use_gpu:
-                    frame_coords = cp.asarray(coords[frame_idx], dtype=cp.float32)
-                    frame_vels = cp.asarray(velocities[frame_idx], dtype=cp.float32)
-                else:
-                    frame_coords = np.asarray(coords[frame_idx])
-                    frame_vels = np.asarray(velocities[frame_idx])
+                # Keep the same precision on both backends: a float32 downcast
+                # can move a float64 separation across an exact bin edge.
+                frame_coords = xp.asarray(coords[frame_idx], dtype=xp.float64)
+                frame_vels = xp.asarray(velocities[frame_idx], dtype=xp.float64)
 
                 for start_i in range(0, n_beads, chunk_size):
                     end_i = min(start_i + chunk_size, n_beads)
@@ -1206,9 +1215,12 @@ class Analyzer:
                 B_current = r_shifted_np.shape[1]
 
                 if use_gpu:
-                    r_shifted_gpu = cp.asarray(r_shifted_np, dtype=cp.float32)
+                    # S1-S2 subtracts O(position^2) terms to recover small
+                    # displacements. Single-precision spectra can yield negative
+                    # MSD even after removing a global coordinate offset.
+                    r_shifted_gpu = cp.asarray(r_shifted_np, dtype=cp.float64)
                     power_sum = cp.zeros(
-                        (n_fft // 2 + 1, B_current), dtype=cp.float32
+                        (n_fft // 2 + 1, B_current), dtype=cp.float64
                     )
                     for dim in range(D):
                         F = cp.fft.rfft(r_shifted_gpu[:, :, dim], n=n_fft, axis=0)
@@ -1219,7 +1231,7 @@ class Analyzer:
                         )
                         / den_xp
                     )
-                    D_sq = cp.sum(r_shifted_gpu.astype(cp.float64) ** 2, axis=2)
+                    D_sq = cp.sum(r_shifted_gpu**2, axis=2)
                 else:
                     F = sp_rfft(r_shifted_np, n=n_fft, axis=0, workers=-1)
                     power_sum = np.sum(F.real**2 + F.imag**2, axis=2)
@@ -1583,7 +1595,7 @@ class Analyzer:
                 for btype, indices in type_indices.items():
                     # Select distances for specific bead types and flatten
                     selected_dist = dist_batch[:, indices].ravel()
-                    
+
                     if use_gpu:
                         distances_by_type_accumulator[btype].append(cp.asnumpy(selected_dist))
                     else:

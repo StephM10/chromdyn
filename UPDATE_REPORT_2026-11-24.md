@@ -65,7 +65,7 @@ This report consolidates all correctness fixes, numerical-stability and performa
 
 ## 3. Verification & Benchmarks
 
-- **Full test suite** (`openmm` Python 3.11.15, `OpenMM 8.5.1`, `SciPy 1.16.3`, `CuPy 14.1.1`, `CHROMDYN_TEST_GPU=1`): **217 passed, 0 failed, 0 skipped**.
+- **Initial local full test suite**, recorded before final review (`openmm` Python 3.11.15, `OpenMM 8.5.1`, `SciPy 1.16.3`, `CuPy 14.1.1`, `CHROMDYN_TEST_GPU=1`): **217 passed, 0 failed, 0 skipped**. The final reproducible, version-controlled test scope is recorded separately below.
 - **Measured checks**:
   - `Writhe (N=250)`: `legacy = 2.2911 s` vs `vectorized = 0.0104 s` (**219.7x speedup**, `abs_diff = 1.15e-13`).
   - `MSD (M=20003 prime frames, B=50, +1e5 offset)`: `0.1176 s` on CPU, `max_rel_diff = 7.81e-10` vs unshifted trajectory, `min_msd = 0.00e+00`.
@@ -79,3 +79,56 @@ This report consolidates all correctness fixes, numerical-stability and performa
 - `.cndb` storage evolution (Route A zero-format optimization vs optional chunked v2 format).
 - Deduplicating `EnergyReporter` / `print_force_info` queries per unique force group.
 - Shared `resolve_array_backend` helper across all analysis modules.
+
+---
+
+## 5. Final Review Corrections and Verification
+
+Final review compared the update with `cd209f7` and checked both documented
+behavior and implementation standards. It reproduced three additional numerical
+edge cases and corrected them before pushing:
+
+- **GPU MSD precision:** for `x(t)=t` over 20,003 frames, the previous float32
+  spectra gave lag-3 MSD `-21.9632` instead of `9`. Shifted coordinates and
+  spectra now remain float64 on GPU; the measured lag-3 result is approximately
+  `9.00000006`. Both bead-resolved and average-MSD public APIs are covered.
+- **Spatial correlation bins:** silently downcasting float64 coordinates to
+  float32 on GPU moved a separation of `0.1` across the first float32 bin edge
+  and changed which bins were empty. Both backends now evaluate geometry and
+  velocity products in float64, preserving the existing bin edges and insertion
+  rule. Exact-edge and large-offset CPU/CUDA comparisons are covered.
+- **Non-finite writhe input:** NaN normals were treated as zero-normal
+  degeneracies and could yield a finite partial writhe. All three public writhe
+  entry points now reject NaN/Inf with `ValueError`, for both implementations;
+  finite planar/duplicate-point controls retain their behavior.
+
+The canonical final command selects **version-controlled tests only** (local
+experimental scripts/tests remain excluded) with `CHROMDYN_TEST_GPU=1`:
+**201 passed, 0 failed, 0 skipped**. This includes 18 added regression cases for
+the three final-review findings. The unchanged pre-review tracked suite had
+183 tests; its scope differs from the initial local 217-test run above.
+
+Final static checks for undefined names/redefinitions and `git diff --check`
+passed. Local wheel construction passed. Refreshed seeded benchmarks (seed
+20261124, this machine only, measured separately from the test run) gave:
+
+- Writhe, N=250: median legacy `2.647 s`, vectorized `0.01349 s`, approximately
+  `196x` faster; absolute difference `3.04e-13`.
+- MSD, 20,003 frames x 50 beads, batch size 10: CPU `0.149 s`, GPU `0.352 s`;
+  max relative translation difference `8.62e-9`, CPU/GPU max absolute difference
+  `1.88e-7`, minimum MSD zero.
+- Spatial velocity correlation, 3 frames x 400 beads, chunk size 128: median
+  CPU `0.01559 s`, GPU `0.05213 s`; maximum absolute difference `8.33e-17`.
+
+These small workloads favor CPU over GPU; batching and float64 accuracy do not
+imply a GPU speedup at every input size. The `0.008314` constant, friction
+equations, RMSProp mapping, cosine continuation, and integration ordering remain
+unchanged.
+
+Wheel-content inspection also reproduced setuptools discovering local namespace
+directories (`local_rheology_checks`, `build/lib`, and `scripts`) as runtime
+packages. Package discovery is now explicitly limited to `chromdyn` and its
+subpackages. `scripts/check_wheel_contents.py` rejects unexpected wheel roots;
+it was checked against the contaminated wheel and the corrected build and is
+run by CI after package construction. Local experimental files remain excluded
+from Git.
