@@ -117,17 +117,29 @@ MSD (`Analyzer.compute_msd` and `Analyzer.compute_msd_average`) shifts each bead
 trajectory by its initial frame in `float64` before FFT and prefix-sum
 evaluation, accumulates `S1` in `float64`, enforces `msd[0] = 0`, and pads
 transforms with `scipy.fft.next_fast_len` while combining all three spatial power
-spectra before a single inverse rFFT. Spatial velocity correlation
+spectra before a single inverse rFFT. GPU shifted coordinates and spectra also
+use `float64`; downcasting those terms can make small-lag MSD negative on long
+ballistic trajectories even after removing a coordinate offset. Spatial velocity correlation
 (`Analyzer.calculate_spatial_vel_corr`) shares a single vectorized CPU/GPU
-implementation using `searchsorted` against the exact `float32` bin edges and
+implementation with `float64` geometry/velocity products on both backends,
+using `searchsorted` against the exact `float32` bin edges and
 flattened `bincount` accumulation, preserving identical `NaN` behavior for empty
 bins.
 
 `Analyzer.compute_writhe_single_curve`, `Analyzer.compute_writhe_between_curves`,
 and `Analyzer.compute_writhe_trajectory` default to `method="vectorized"` with
 degenerate zero-normal guards and open-curve (`closed=False`) segment bounds;
+all public writhe entry points reject NaN/Inf coordinates with `ValueError`,
+keeping invalid trajectories distinct from finite degenerate geometry;
 passing `method="legacy"` selects the original pairwise scalar implementation.
 
 Hi-C GPU calculation (`_calc_HiC_from_traj_array_gpu` and the streaming CUDA
 CNDB entry points) transfers at most `batch_size` frames to the device at a time
 and accumulates contact probabilities in `float64` before dividing by frame count.
+
+## Distribution scope
+
+Package discovery includes only `chromdyn` and its subpackages. CI validates the
+wheel with `scripts/check_wheel_contents.py`, rejecting local experiments or
+build directories. Build from a clean source tree: stale `build/lib` contents
+from an older discovery configuration can otherwise survive a local rebuild.
