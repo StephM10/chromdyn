@@ -23,6 +23,16 @@ from .utilities import LogManager
 from typing import Optional, Tuple, List, Dict, Union, Any
 
 
+def _flat_bottom_expression(radius: str, stiffness: str, squared_distance: str) -> str:
+    # q=0 has exactly zero energy and force, including the radius=0 limit.
+    # The inactive sqrt branch uses a finite placeholder only at q=0; adding
+    # an epsilon to all distances would instead change the physical potential.
+    return (
+        f"select(q, step(r-{radius})*0.5*{stiffness}*(r-{radius})^2, 0);"
+        f"r=sqrt(q+delta(q));q={squared_distance}"
+    )
+
+
 class ForceFieldManager:
     def __init__(
         self,
@@ -90,16 +100,17 @@ class ForceFieldManager:
             if force.__class__.__name__ == "CustomNonbondedForce":
                 force.setNonbondedMethod(self.nonbonded_method)
                 force.setCutoffDistance(self.nonbonded_cutoff)
-                print(f"Updated nonbonded method for {name} to {method}.")
                 self.logger.info(f"Updated nonbonded method for {name} to {method}.")
 
     def register_force(self, force_obj: object, name: str, **kwargs: Any) -> None:
+        if name in self.forceDict:
+            raise ValueError(f"Force name already registered: {name}")
         if (
             self.exclude_bonds_from_NonBonded
             and force_obj.__class__.__name__ == "CustomNonbondedForce"
         ):
             force_obj.createExclusionsFromBonds(
-                [[int(bond[0].id), int(bond[1].id)] for bond in self.topology.bonds()],
+                [[bond[0].index, bond[1].index] for bond in self.topology.bonds()],
                 1,
             )
             self.logger.info("Added exclusions from bonded monomers.")
@@ -111,7 +122,7 @@ class ForceFieldManager:
 
     def add_exclusions_from_bonds(self, force: object) -> None:
         for bond in self.topology.bonds():
-            force.addExclusion(int(bond[0].id), int(bond[1].id))
+            force.addExclusion(bond[0].index, bond[1].index)
 
     def _isForceDictEqualSystemForces(self) -> bool:
         forcesInDict = [x.this for x in self.forceDict.values()]
@@ -121,14 +132,25 @@ class ForceFieldManager:
         )
 
     def _getForceIndex(self, forceName: str) -> int:
-        return [key for key, item in self.force_name_map.items() if item == forceName][
-            0
-        ]
+        target = self.forceDict[forceName]
+        for index, force in enumerate(self.system.getForces()):
+            if force.this == target.this:
+                return index
+        raise RuntimeError(f"Registered force is missing from System: {forceName}")
+
+    def _refresh_force_names(self) -> None:
+        names = {int(force.this): name for name, force in self.forceDict.items()}
+        self.force_name_map = {
+            index: names[int(force.this)]
+            for index, force in enumerate(self.system.getForces())
+            if int(force.this) in names
+        }
 
     def removeForce(self, context: object, forceName: str) -> None:
         if forceName in self.forceDict:
             self.system.removeForce(self._getForceIndex(forceName))
             del self.forceDict[forceName]
+            self._refresh_force_names()
             context.reinitialize(preserveState=True)
             self.logger.info(f"Removed {forceName} from the system!")
             assert (
@@ -180,7 +202,7 @@ class ForceFieldManager:
         bond_force.setForceGroup(group)
         num_bonds = 0
         for bond in self.topology.bonds():
-            bond_force.addBond(int(bond[0].id), int(bond[1].id), r0, k)
+            bond_force.addBond(bond[0].index, bond[1].index, r0, k)
             num_bonds += 1
         self.logger.info(
             f"Adding {num_bonds} harmonic bonds with r0={r0}, k={k}, group={group}"
@@ -197,7 +219,7 @@ class ForceFieldManager:
 
         bonded_neighbors = {atom.index: [] for atom in self.topology.atoms()}
         for bond in self.topology.bonds():
-            a, b = int(bond[0].id), int(bond[1].id)
+            a, b = bond[0].index, bond[1].index
             bonded_neighbors[a].append(b)
             bonded_neighbors[b].append(a)
 
@@ -234,7 +256,7 @@ class ForceFieldManager:
         fene_force.addGlobalParameter("R0_fene", R0)
 
         for bond in self.topology.bonds():
-            fene_force.addBond(int(bond[0].id), int(bond[1].id), ())
+            fene_force.addBond(bond[0].index, bond[1].index, ())
 
         fene_force.setForceGroup(group)
         self.register_force(fene_force, "FENEBonds")
@@ -250,8 +272,7 @@ class ForceFieldManager:
             f"Adding Harmonic Trap with kr={kr}, center={center}, force group={group}"
         )
         restraintForce = CustomExternalForce(
-            "0.5 * k_harm_trap * r * r; "
-            "r = sqrt( (x - x0_trap)^2 + (y - y0_trap)^2 + (z - z0_trap)^2 )"
+            "0.5*k_harm_trap*((x-x0_trap)^2+(y-y0_trap)^2+(z-z0_trap)^2)"
         )
         restraintForce.addGlobalParameter("k_harm_trap", kr)
         restraintForce.addGlobalParameter("x0_trap", center[0])
@@ -272,13 +293,14 @@ class ForceFieldManager:
         group: int = 1,
     ) -> None:
         """Adds a flat-bottom harmonic potential to confine particles inside a spherical boundary."""
+        if not np.isfinite(r0) or r0 < 0:
+            raise ValueError("r0 radius must be finite and nonnegative")
         self.logger.info("-" * 50)
         self.logger.info("Adding Flat-Bottom Harmonic potential with parameters:")
         self.logger.info(f"k = {k}, r0 = {r0}, group = {group}")
 
-        energy_expr = (
-            "step(r - rRes) * 0.5 * kR * (r - rRes)^2;"
-            "r = sqrt((x - x0)^2 + (y - y0)^2 + (z - z0)^2)"
+        energy_expr = _flat_bottom_expression(
+            "rRes", "kR", "(x-x0)^2+(y-y0)^2+(z-z0)^2"
         )
 
         restraintForce = CustomExternalForce(energy_expr)
@@ -330,6 +352,8 @@ class ForceFieldManager:
 
         if any(idx < 0 or idx >= n_atoms for idx in particle_indices):
             raise ValueError(f"One or more indices are out of range (0..{n_atoms-1})")
+        if not np.all(np.isfinite(r0s)) or np.any(np.asarray(r0s) < 0):
+            raise ValueError("r0 radii must be finite and nonnegative")
 
         self.logger.info("-" * 50)
         self.logger.info(
@@ -338,9 +362,8 @@ class ForceFieldManager:
         self.logger.info(f"Group = {group}, Num particles = {len(particle_indices)}")
 
         # Energy expression: flat-bottom harmonic
-        energy_expr = (
-            "step(r - rRes) * 0.5 * kR * (r - rRes)^2;"
-            "r = sqrt((x - x0)^2 + (y - y0)^2 + (z - z0)^2)"
+        energy_expr = _flat_bottom_expression(
+            "rRes", "kR", "(x-x0)^2+(y-y0)^2+(z-z0)^2"
         )
 
         restraintForce = CustomExternalForce(energy_expr)
@@ -373,6 +396,10 @@ class ForceFieldManager:
         radius ``r_cyl`` in the xy-plane and half-height ``z_cyl`` along z.
         The axial confinement vanishes for ``-z_cyl <= z <= z_cyl``.
         """
+        if not np.isfinite(r_cyl) or r_cyl < 0:
+            raise ValueError("r_cyl radius must be finite and nonnegative")
+        if not np.isfinite(z_cyl) or z_cyl < 0:
+            raise ValueError("z_cyl half-height must be finite and nonnegative")
         self.logger.info("-" * 50)
         self.logger.info("Adding Cylindrical Confinement force:")
         self.logger.info(
@@ -380,9 +407,8 @@ class ForceFieldManager:
         )
 
         energy_expr = (
-            "step(r_xy-r_cyl)*0.5*k_cyl*(r_xy-r_cyl)^2 + "
-            "step(abs(z)-z_cyl)*0.5*k_cyl*(abs(z)-z_cyl)^2; "
-            "r_xy=sqrt(x^2+y^2)"
+            "step(abs(z)-z_cyl)*0.5*k_cyl*(abs(z)-z_cyl)^2 + "
+            + _flat_bottom_expression("r_cyl", "k_cyl", "x^2+y^2")
         )
 
         confinement_force = CustomExternalForce(energy_expr)

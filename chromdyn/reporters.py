@@ -11,7 +11,8 @@ from openmm.app import Simulation
 from openmm import System, State
 from openmm.app import Topology
 import openmm.unit as unit
-from openmm import CMMotionRemover
+from openmm import CMMotionRemover, BrownianIntegrator
+from .integrators import ActiveBrownianIntegrator, ActiveBrownianIntegratorLegacy, ActiveLangevinIntegrator
 import os
 from datetime import datetime
 from .utilities import LogManager
@@ -173,7 +174,23 @@ class StabilityReporter:
         potential_threshold: float = 1000.0,
         scale: float = 1.0,
         force_reinitialize: bool = True,
+        reference_energy: Optional[float] = None,
     ):
+        """Monitor energy per particle in kJ/mol.
+
+        Dimensionless thresholds use 1.5*kBT, or the explicitly supplied positive
+        reference_energy. At T=0 without a reference, only finiteness is checked.
+        Overdamped integrators never use kinetic thresholds or velocity resets.
+        Unknown custom integrators must supply reference_energy; their velocities
+        are not reset without a known thermostat temperature.
+        """
+        if reference_energy is not None:
+            if unit.is_quantity(reference_energy):
+                reference_energy = reference_energy.value_in_unit(unit.kilojoule_per_mole)
+            if not np.isfinite(reference_energy) or reference_energy <= 0:
+                raise ValueError("reference_energy must be finite and positive")
+        self.reference_energy = reference_energy
+        self.is_paused = False
         self.saveFile = open(filename, "w")
         self.interval: int = reportInterval
         self.kinetic_threshold: float = kinetic_threshold
@@ -200,55 +217,60 @@ class StabilityReporter:
             True,
         )  # positions, velocities, forces, energies
 
+    def close(self) -> None:
+        self.saveFile.close()
+
+    def pause(self) -> None:
+        self.is_paused = True
+
+    def resume(self) -> None:
+        self.is_paused = False
+
     def report(self, simulation: Simulation, state: State) -> None:
-        """
-        Main method called at every reportInterval steps. Checks energies and reinitializes velocities if needed.
-        """
+        if self.is_paused:
+            return
+        integrator = simulation.integrator
+        overdamped = isinstance(integrator, (BrownianIntegrator, ActiveBrownianIntegrator, ActiveBrownianIntegratorLegacy))
         num_particles = simulation.system.getNumParticles()
-        e_kinetic = (
-            state.getKineticEnergy().value_in_unit(unit.kilojoules_per_mole)
-            / num_particles
-        )
-        e_potential = (
-            state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-            / num_particles
-        )
+        e_kinetic = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)/num_particles
+        e_potential = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)/num_particles
+        if not np.isfinite(e_potential) or (not overdamped and not np.isfinite(e_kinetic)):
+            message = f"Non-finite energy at step {simulation.currentStep}: KE={e_kinetic}, PE={e_potential}"
+            self.saveFile.write(f"<<INSTABILITY | {message}>>\n")
+            self.saveFile.flush()
+            self.logger.error(message)
+            raise FloatingPointError(message)
 
-        if hasattr(simulation.integrator, "getTemperature"):
-            temperature = simulation.integrator.getTemperature().value_in_unit(
-                unit.kelvin
-            )
-        else:
-            temperature = 240.0
+        temperature = None
+        kbT = None
+        if hasattr(integrator, "getTemperature"):
+            temperature = integrator.getTemperature().value_in_unit(unit.kelvin)
+            kbT = 0.008314*temperature
+        elif isinstance(integrator, (ActiveBrownianIntegrator, ActiveBrownianIntegratorLegacy, ActiveLangevinIntegrator)):
+            kbT = integrator.getGlobalVariableByName("kbT")
+            temperature = kbT/0.008314
+        elif self.reference_energy is None:
+            raise ValueError("Unknown custom integrator requires reference_energy for StabilityReporter")
 
-        kBT = 0.008314 * temperature
-        e_kinetic_expected = 1.5 * kBT
-
-        if (
-            e_kinetic / e_kinetic_expected > self.kinetic_threshold
-            or abs(e_potential) / e_kinetic_expected > self.potential_threshold
-        ):
-
-            if self.force_reinitialize:
-                seed = np.random.randint(100_000)
-                simulation.context.setVelocitiesToTemperature(temperature, seed)
-                self.saveFile.write(
-                    f"<<INSTABILITY | Reinitialized velocities>> Step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}\n"
-                )
-                self.saveFile.flush()
-                if simulation.currentStep % (self.interval * 100) == 0:
-                    self.logger.warning(
-                        f"<<INSTABILITY | Reinitialized velocities>> at step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}"
-                    )
-            else:
-                self.saveFile.write(
-                    f"<<INSTABILITY | Detected but NOT reinitialized velocities>> Step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}\n"
-                )
-                self.saveFile.flush()
-                if simulation.currentStep % (self.interval * 100) == 0:
-                    self.logger.warning(
-                        f"<<INSTABILITY | Detected but NOT reinitialized velocities>> at step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}"
-                    )
+        reference = self.reference_energy
+        if reference is None and kbT is not None and kbT > 0:
+            reference = 1.5*kbT
+        if reference is None:
+            return
+        unstable = abs(e_potential)/reference > self.potential_threshold
+        if not overdamped:
+            unstable |= e_kinetic/reference > self.kinetic_threshold
+        if not unstable:
+            return
+        action = "Detected"
+        if self.force_reinitialize and not overdamped and temperature is not None:
+            simulation.context.setVelocitiesToTemperature(temperature, np.random.randint(100_000))
+            action = "Reinitialized velocities"
+        message = f"<<INSTABILITY | {action}>> Step {simulation.currentStep}: K.E. = {e_kinetic:.2f} | P.E. = {e_potential:.2f}"
+        self.saveFile.write(message+"\n")
+        self.saveFile.flush()
+        if simulation.currentStep % (self.interval*100) == 0:
+            self.logger.warning(message)
 
 
 class EnergyReporter:
@@ -266,6 +288,9 @@ class EnergyReporter:
         self.report_force_grp: bool = reportForceGrp
         self.is_initialized: bool = False
         self.is_paused: bool = False
+
+    def close(self) -> None:
+        self.saveFile.close()
 
     def pause(self) -> None:
         self.is_paused = True

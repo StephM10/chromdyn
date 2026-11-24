@@ -3,10 +3,13 @@ Visualization module for ChromDyn.
 This module is an optional dependency. It requires 'matplotlib' to be installed.
 """
 
+import logging
 import warnings
 import numpy as np
 import itertools
 import os
+
+logger = logging.getLogger(__name__)
 
 try:
     import matplotlib.pyplot as plt
@@ -238,11 +241,11 @@ def visualize(
 
     if PBC:
         recenter = True
-        print("PBC is enabled, automatically recentering.")
+        logger.info("PBC is enabled, automatically recentering.")
 
     # --- 1. Data & Topology Check ---
     if not hasattr(traj, "topology") or traj.topology is None:
-        print("Error: Topology not found in trajectory.")
+        logger.error("Topology not found in trajectory.")
         return
 
     chain_selections = []
@@ -274,12 +277,12 @@ def visualize(
                 polymer_coords_orig.append(np.array([]))
 
     except Exception as e:
-        print(f"Error loading coordinates at frame {select_frame}: {e}")
+        logger.error(f"Error loading coordinates at frame {select_frame}: {e}")
         return
 
     # Check if we got data
     if not polymer_coords_orig or all(c.size == 0 for c in polymer_coords_orig):
-        print(f"Error: No valid coordinate data found for frame {select_frame}.")
+        logger.error(f"No valid coordinate data found for frame {select_frame}.")
         return
 
     box_vectors = None
@@ -291,12 +294,12 @@ def visualize(
             pass  # Fallback below
     if PBC:
         if box_vectors is None:
-            print("Warning: No box vectors found. Assuming 100nm cube.")
+            logger.warning("No box vectors found. Assuming 100nm cube.")
             box_vectors = np.eye(3) * 100.0
 
     # --- 4. Recenter ---
     if recenter:
-        print("Recentering coordinates...")
+        logger.info("Recentering coordinates...")
         polymer_coords = recenter_coordinates_v3(polymer_coords_orig, box_vectors)
     else:
         polymer_coords = polymer_coords_orig
@@ -313,14 +316,14 @@ def visualize(
         # if types are provided, use them
         if types is not None:
             types_seq = types
-            print(f"Using provided types: {types_seq}")
+            logger.info(f"Using provided types: {types_seq}")
         if types_seq is None:
-            print(
-                "Warning: 'type' mode requested but no types found. Switching to 'chain'."
+            logger.warning(
+                "'type' mode requested but no types found. Switching to 'chain'."
             )
             color_mode = "chain"
         else:
-            print(f"Using types from trajectory: {types_seq}")
+            logger.info(f"Using types from trajectory: {types_seq}")
             unique_types = sorted(list(set(types_seq)))
             cmap = plt.get_cmap("tab10")
             type_map = {t: cmap(i % 10) for i, t in enumerate(unique_types)}
@@ -483,7 +486,7 @@ def visualize(
     # --- 10. Output & Display ---
     if output_name:
         plt.savefig(output_name, dpi=300)
-        print(f"Plot saved to {output_name}")
+        logger.info(f"Plot saved to {output_name}")
         plt.close(fig)
     else:
         plt.show()
@@ -590,9 +593,11 @@ def visualize_animation(
       reducing fps or frame count if file size is a concern.
     """
 
+    _check_matplotlib()
+
     # --- 1. Data Preparation (Vectorized) ---
     if not hasattr(traj, "topology") or traj.topology is None:
-        print("Error: Topology not found.")
+        logger.error("Topology not found.")
         return
 
     chain_selections = []
@@ -618,7 +623,7 @@ def visualize_animation(
         start_frame = 0
     num_anim_frames = end_frame - start_frame
 
-    print(f"Loading frames {start_frame} to {end_frame}...")
+    logger.info(f"Loading frames {start_frame} to {end_frame}...")
 
     # Load Coordinates
     try:
@@ -637,7 +642,7 @@ def visualize_animation(
         if data_all.ndim == 2:
             data_all = data_all[np.newaxis, :, :]
     except Exception as e:
-        print(f"Error calling traj.xyz: {e}")
+        logger.error(f"Error calling traj.xyz: {e}")
         return
 
     if len(data_all) == 0:
@@ -758,11 +763,11 @@ def visualize_animation(
             s_val = s_phys
             
             if s_phys.ndim > 0 and s_phys.size > 1:
-                print(
+                logger.info(
                     f"Calculated {s_phys.size} physical marker sizes (min: {np.min(s_phys):.2f}, max: {np.max(s_phys):.2f})"
                 )
             else:
-                print(
+                logger.info(
                     f"Calculated physical marker size: {float(s_phys):.2f} points^2 (for r={r} nm)"
                 )
 
@@ -805,14 +810,14 @@ def visualize_animation(
         ax.set_title(f"Frame {start_frame + frame_idx}")
         return scat, line_collection
 
-    print("Generating animation...")
+    logger.info("Generating animation...")
     anim = FuncAnimation(
         fig, update, frames=num_anim_frames, interval=1000 / fps, blit=False
     )
 
     if output_name is None:
         # Do not save the animation
-        print("No output_name provided, returning animation object for display.")
+        logger.info("No output_name provided, returning animation object for display.")
         plt.close(fig)
         return anim
 
@@ -831,11 +836,11 @@ def visualize_animation(
         writer_backend = "ffmpeg"
     else:
         # Default to GIF if no extension is provided
-        print(f"Warning: Unknown extension '{ext}', defaulting to .gif")
+        logger.warning(f"Unknown extension '{ext}', defaulting to .gif")
         output_name = os.path.splitext(output_name)[0] + ".gif"
         writer_backend = "pillow"
 
-    print(f"Saving animation to {output_name} using writer='{writer_backend}'...")
+    logger.info(f"Saving animation to {output_name} using writer='{writer_backend}'...")
 
     try:
         if writer_backend == "ffmpeg":
@@ -848,11 +853,11 @@ def visualize_animation(
             )
         else:  # pillow
             anim.save(output_name, writer="pillow", fps=fps, dpi=150)
-        print(f"Successfully saved animation to {output_name}")
+        logger.info(f"Successfully saved animation to {output_name}")
     except Exception as e:
-        print(f"Error saving animation: {e}")
+        logger.error(f"Error saving animation: {e}")
         if writer_backend == "ffmpeg":
-            print(
+            logger.info(
                 "Tip: Try using writer='pillow' to save as GIF instead (no ffmpeg dependency)"
             )
 
@@ -1001,7 +1006,7 @@ def visualize_pbc_images(
 
     # --- 1. Data Loading ---
     if not hasattr(traj, "topology") or traj.topology is None:
-        print("Error: Topology not found.")
+        logger.error("Topology not found.")
         return
 
     # Check Box
@@ -1012,7 +1017,7 @@ def visualize_pbc_images(
         except Exception:
             pass
     if box_vectors is None:
-        print("Error: No box vectors.")
+        logger.error("No box vectors.")
         return
 
     # Load Coords
@@ -1041,7 +1046,7 @@ def visualize_pbc_images(
             else:
                 polymer_coords_orig.append(np.array([]))
     except Exception as e:
-        print(f"Error loading coords: {e}")
+        logger.error(f"Error loading coords: {e}")
         return
 
     # --- 2. Recenter ---
@@ -1154,7 +1159,7 @@ def visualize_pbc_images(
                 image_scatters.append(sc)
 
     # --- 5. Plotting Loop ---
-    print(f"Plotting {len(shifts)} lattice copies...")
+    logger.info(f"Plotting {len(shifts)} lattice copies...")
     all_plotted_points = []
 
     for i_grid, j_grid, k_grid in shifts:
@@ -1260,7 +1265,7 @@ def visualize_pbc_images(
     # --- 8. Output ---
     if output_name:
         plt.savefig(output_name, dpi=300)
-        print(f"Plot saved to {output_name}")
+        logger.info(f"Plot saved to {output_name}")
         plt.close(fig)
     else:
         plt.show()

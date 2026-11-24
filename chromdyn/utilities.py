@@ -30,50 +30,49 @@ class LogManager:
         self.log_level = log_level
         self.log_format = log_format
         self.log_file = log_file
+        self._owned_handlers = []
 
-    def get_logger(self, name, console=True):
+    def get_logger(self, name, console=True, *, isolated=False):
+        """Get a module logger, or an independently owned simulation logger.
+
+        Module configuration is idempotent and preserves application handlers.
+        File-backed/isolated loggers are not placed in logging's global registry,
+        so simulations with the same module name cannot redirect each other.
         """
-        Get a logger instance with console and optional file handler.
-
-        Args:
-            name (str): Module-specific logger name.
-
-        Returns:
-            logging.Logger: Configured logger.
-        """
-        logger = logging.getLogger(name)
-        logger.setLevel(self.log_level)
-
-        while len(logger.handlers) > 0:
-            logger.handlers.clear()
-
-        # Avoid adding multiple handlers if logger already has handlers
-        if not logger.handlers:
-            # Console handler
-            if console:
-                console_handler = logging.StreamHandler()
-                console_handler.setLevel(logging.INFO)
-                console_handler.setFormatter(
-                    logging.Formatter(
-                        "%(asctime)s | %(levelname)s | %(module)s | %(message)s"
-                    )
-                )
-                logger.addHandler(console_handler)
-
-            # Optional file handler
-            if self.log_file:
-                os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
-                file_handler = logging.FileHandler(self.log_file, mode="w")
-                file_handler.setLevel(
-                    logging.DEBUG
-                )  # Log everything into file, including DEBUG
-                file_formatter = logging.Formatter(
-                    "%(asctime)s | %(levelname)s | %(module)s | %(message)s"
-                )
-                file_handler.setFormatter(file_formatter)
-                logger.addHandler(file_handler)
-
+        isolated = isolated or self.log_file is not None
+        if isolated:
+            logger = logging.Logger(name, self.log_level)
+            logger.propagate = False
+        else:
+            logger = logging.getLogger(name)
+            if logger.handlers:
+                return logger
+            if logger.level == logging.NOTSET:
+                logger.setLevel(self.log_level)
+        handlers = []
+        if console and (isolated or not logger.hasHandlers()):
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.INFO)
+            handlers.append(handler)
+        if self.log_file is not None:
+            os.makedirs(os.path.dirname(os.path.abspath(self.log_file)), exist_ok=True)
+            handler = logging.FileHandler(self.log_file, mode="w", encoding="utf-8")
+            handler.setLevel(logging.DEBUG)
+            handlers.append(handler)
+        if isolated and not handlers:
+            handlers.append(logging.NullHandler())
+        for handler in handlers:
+            handler.setFormatter(logging.Formatter(self.log_format))
+            logger.addHandler(handler)
+            self._owned_handlers.append((logger, handler))
         return logger
+
+    def close(self):
+        """Close only handlers created by this manager; repeated calls are safe."""
+        for logger, handler in self._owned_handlers:
+            logger.removeHandler(handler)
+            handler.close()
+        self._owned_handlers.clear()
 
     @staticmethod
     def log_header(logger, title, width=100, char="="):
