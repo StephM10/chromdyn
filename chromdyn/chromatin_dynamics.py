@@ -7,6 +7,7 @@
 #  * --------------------------------------------------------------------------- *
 
 import time
+from contextlib import ExitStack
 import numpy as np
 from pathlib import Path
 from openmm import System, Vec3
@@ -41,16 +42,13 @@ class ChromatinDynamics:
 
         self.name = name
         self.version = _get_version()
-        if write_logs:
-            self.output_dir = Path(output_dir)
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-
-            self.logger = LogManager(
-                log_file=self.output_dir / f"{name}.log"
-            ).get_logger(__name__, console=console_stream)
-        else:
-            self.output_dir = None
-            self.logger = LogManager().get_logger(__name__, console=console_stream)
+        self.output_dir = Path(output_dir)
+        self._log_manager = LogManager(
+            log_file=self.output_dir/f"{name}.log" if write_logs else None
+        )
+        self.logger = self._log_manager.get_logger(
+            __name__, console=console_stream, isolated=True
+        )
 
         self.logger.info("*" * 60)
         self.logger.info(f"{f'chromdyn v{self.version} : Chromatin Dynamics':^60}")
@@ -130,6 +128,8 @@ class ChromatinDynamics:
         advance_time: bool = False,
         store_unconstrained_positions: bool = False,
         precompute_coefficients: bool = True,
+        store_thermal_kick: bool = False,
+        stability_reference_energy: Optional[float] = None,
     ) -> None:
         """Sets up the integrator, platform, context, and attaches reporters.
 
@@ -138,7 +138,12 @@ class ChromatinDynamics:
         by default to avoid an extra GPU update kernel.
         ``precompute_coefficients`` enables cached active Brownian coefficients
         by default; explicit activity and integrator parameter setters refresh
-        them automatically.
+        them automatically. Set store_thermal_kick to retain the applied per-DOF
+        thermal displacement of the last active-Brownian step in thermal_kick.
+        ``friction`` is inverse-time gamma except for active-brownian, which
+        uses physical drag g directly (g=m*gamma). See NUMERICAL_NOTES.md.
+        ``stability_reference_energy`` optionally supplies the positive energy
+        per particle (kJ/mol) used by dimensionless stability thresholds.
         """
 
         # ---- Periodic boundary conditions (optional) ----
@@ -165,6 +170,7 @@ class ChromatinDynamics:
             advance_time=advance_time,
             store_unconstrained_positions=store_unconstrained_positions,
             precompute_coefficients=precompute_coefficients,
+            store_thermal_kick=store_thermal_kick,
         )
 
         self.simulation = Simulation(
@@ -206,6 +212,9 @@ class ChromatinDynamics:
         self.logger.info("Simulation context initialized.")
         self.print_force_info()
 
+        if save_pos or save_energy or stability_check or save_forcefield:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
         if save_pos:
             path = self.output_dir / f"{self.name}_positions.cndb"
             self.reporters["position"] = SaveStructure(
@@ -237,6 +246,7 @@ class ChromatinDynamics:
                 kinetic_threshold=5.0,
                 potential_threshold=5.0,
                 force_reinitialize=force_reinitialize,
+                reference_energy=stability_reference_energy,
             )
             self.simulation.reporters.append(self.reporters["stability"])
             self.logger.info(f"Stability reporter created: {path}")
@@ -315,8 +325,8 @@ class ChromatinDynamics:
             )[mono_id]
         return ret
 
-    def run(self, n_steps: int, verbose: bool = True, report: bool = True) -> float:
-        """Runs the simulation and reports performance."""
+    def run(self, n_steps: int, verbose: bool = True, report: bool = True) -> None:
+        """Run steps; report=False temporarily detaches all reporters."""
         if not self.simulation:
             raise RuntimeError(
                 "Simulation not initialized. Call simulation_setup() first."
@@ -326,8 +336,9 @@ class ChromatinDynamics:
             self.logger.info("-" * 60)
             self.logger.info(f"Running simulation for {n_steps} steps...")
 
+        saved_reporters = self.simulation.reporters
         if not report:
-            self.pause_reporters()
+            self.simulation.reporters = []
 
         start = time.perf_counter()
         try:
@@ -335,6 +346,9 @@ class ChromatinDynamics:
         except Exception as e:
             self.logger.error(f"Simulation error: {e}")
             raise
+        finally:
+            if not report:
+                self.simulation.reporters = saved_reporters
 
         elapsed = max(time.perf_counter() - start, np.finfo(float).eps)
         steps_per_sec = n_steps / elapsed
@@ -344,9 +358,6 @@ class ChromatinDynamics:
                 f"Completed {n_steps} steps in {elapsed:.2f}s ({steps_per_sec:.0f} steps/s)"
             )
             self.logger.info("-" * 60)
-
-        if not report:
-            self.resume_reporters()
 
     def pause_reporters(self) -> None:
         for name, reporter in self.reporters.items():
@@ -361,11 +372,23 @@ class ChromatinDynamics:
                 self.logger.info(f"Resumed reporter: {name}")
 
     def save_reports(self) -> None:
-        if "position" in self.reporters and hasattr(
-            self.reporters["position"], "close"
-        ):
-            self.reporters["position"].close()
-            self.logger.info("Closed position reporter file.")
+        """Finalize and detach all owned report files; external reporters stay open."""
+        owned = [r for r in self.reporters.values() if hasattr(r, "close")]
+        if self.simulation is not None:
+            self.simulation.reporters[:] = [
+                r for r in self.simulation.reporters
+                if not any(r is own for own in owned)
+            ]
+        with ExitStack() as stack:
+            for reporter in owned:
+                stack.callback(reporter.close)
+
+    def close(self) -> None:
+        """Finalize reports and release this instance's log file handlers."""
+        try:
+            self.save_reports()
+        finally:
+            self._log_manager.close()
 
     def print_force_info(self) -> None:
         """Logs a formatted summary of forces and per-particle energy."""

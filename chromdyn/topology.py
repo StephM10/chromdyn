@@ -42,6 +42,8 @@ class TopologyGenerator:
         """
         # Number of atoms in each residue
         atoms_per_residue: int = int(kwargs.get("atoms_per_residue", 1))
+        if atoms_per_residue < 1:
+            raise ValueError("atoms_per_residue must be positive")
 
         # Default chain names if not provided
         if chain_names is None:
@@ -62,7 +64,7 @@ class TopologyGenerator:
             elif types == "unique":
                 # Assign unique types for each atom
                 atom_types = [f"M{xx}" for xx in range(1, sum(chain_lens) + 1)]
-            elif len(types) < 4:
+            else:
                 # Use single type for all atoms
                 atom_types = [types] * sum(chain_lens)
         elif isinstance(types, list):
@@ -81,36 +83,18 @@ class TopologyGenerator:
         for cid, chain_len in enumerate(chain_lens):
             chain = self.topology.addChain(chain_names[cid])  # Add a new chain
             previous_atom = None
-            num_residues = chain_len // atoms_per_residue  # Full residues
-            small_residue_atoms = chain_len % atoms_per_residue  # Remainder atoms
-
-            # Add full residues
-            for resid in range(1, num_residues + 1):
-                residue = self.topology.addResidue(f"L{resid}", chain)
-                for aid in range(atoms_per_residue):
-                    atom = self.topology.addAtom(
-                        f"{chain_names[cid]}-L{resid}-{aid+1}",
-                        f"{atom_types[kk]}",
-                        residue,
-                        f"{kk}",
-                    )
-                    if previous_atom is not None:
-                        self.topology.addBond(
-                            previous_atom, atom
-                        )  # Bond with previous atom
-                    kk += 1
-                    previous_atom = atom
-
-            # Add any leftover atoms as an additional residue
-            for ii in range(small_residue_atoms):
-                residue = self.topology.addResidue(f"L{resid+1}", chain)
+            for local_index in range(chain_len):
+                resid, aid = divmod(local_index, atoms_per_residue)
+                if aid == 0:
+                    residue = self.topology.addResidue(f"L{resid+1}", chain)
                 atom = self.topology.addAtom(
-                    f"{chain_names[cid]}-L{resid}-{ii+1}",
+                    f"{chain_names[cid]}-L{resid+1}-{aid+1}",
                     f"{atom_types[kk]}",
                     residue,
                     f"{kk}",
                 )
-                self.topology.addBond(previous_atom, atom)
+                if previous_atom is not None:
+                    self.topology.addBond(previous_atom, atom)
                 previous_atom = atom
                 kk += 1
 

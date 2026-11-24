@@ -7,10 +7,12 @@
 #  * --------------------------------------------------------------------------- *
 
 from __future__ import annotations
+import logging
 from multiprocessing import Pool, cpu_count
 from typing import Dict, Union, List, Optional, Tuple
 from pathlib import Path
 import numpy as np
+from scipy.fft import next_fast_len, rfft as sp_rfft, irfft as sp_irfft
 import h5py
 import os
 import openmm.unit as unit
@@ -19,6 +21,7 @@ import warnings
 from collections import defaultdict
 from itertools import combinations_with_replacement
 
+logger = logging.getLogger(__name__)
 
 # for GPU acceleration
 try:
@@ -26,10 +29,6 @@ try:
 
     CUPY_AVAILABLE = True
 except ImportError:
-    warnings.warn(
-        "Cupy not found. GPU acceleration not available. Calculations will be on CPU",
-        UserWarning, stacklevel=2
-    )
     CUPY_AVAILABLE = False
     cp = None
 
@@ -170,8 +169,55 @@ class Analyzer:
 
         return float((omega_star / (4 * np.pi)) * sign)
 
+    @staticmethod
+    def _segment_solid_angle_batch(
+        p1: np.ndarray,
+        p2: np.ndarray,
+        q1: np.ndarray,
+        q2: np.ndarray,
+    ) -> np.ndarray:
+        """Vectorized Gauss linking solid angle for batches of segment pairs."""
+        r13 = q1 - p1
+        r14 = q2 - p1
+        r23 = q1 - p2
+        r24 = q2 - p2
+
+        n1 = np.cross(r13, r14)
+        n2 = np.cross(r14, r24)
+        n3 = np.cross(r24, r23)
+        n4 = np.cross(r23, r13)
+
+        norm1 = np.linalg.norm(n1, axis=-1, keepdims=True)
+        norm2 = np.linalg.norm(n2, axis=-1, keepdims=True)
+        norm3 = np.linalg.norm(n3, axis=-1, keepdims=True)
+        norm4 = np.linalg.norm(n4, axis=-1, keepdims=True)
+
+        valid = (
+            (norm1[..., 0] > 0)
+            & (norm2[..., 0] > 0)
+            & (norm3[..., 0] > 0)
+            & (norm4[..., 0] > 0)
+        )
+
+        n1_u = np.divide(n1, norm1, out=np.zeros_like(n1), where=norm1 > 0)
+        n2_u = np.divide(n2, norm2, out=np.zeros_like(n2), where=norm2 > 0)
+        n3_u = np.divide(n3, norm3, out=np.zeros_like(n3), where=norm3 > 0)
+        n4_u = np.divide(n4, norm4, out=np.zeros_like(n4), where=norm4 > 0)
+
+        d12 = np.clip(np.einsum("...i,...i->...", n1_u, n2_u), -1.0, 1.0)
+        d23 = np.clip(np.einsum("...i,...i->...", n2_u, n3_u), -1.0, 1.0)
+        d34 = np.clip(np.einsum("...i,...i->...", n3_u, n4_u), -1.0, 1.0)
+        d41 = np.clip(np.einsum("...i,...i->...", n4_u, n1_u), -1.0, 1.0)
+
+        omega_star = (
+            np.arcsin(d12) + np.arcsin(d23) + np.arcsin(d34) + np.arcsin(d41)
+        )
+        sign = np.sign(np.einsum("...i,...i->...", np.cross(q2 - q1, p2 - p1), r13))
+        result = (omega_star / (4.0 * np.pi)) * sign
+        return np.where(valid, result, 0.0)
+
     @classmethod
-    def compute_writhe_single_curve(
+    def _compute_writhe_single_curve_legacy(
         cls,
         coords: np.ndarray,
         closed: bool = True,
@@ -179,38 +225,72 @@ class Analyzer:
         N = len(coords)
         if closed:
             coords = np.vstack((coords, coords[0]))  # Close the loop
+        n_seg = N if closed else max(N - 1, 0)
 
         writhe = 0.0
-        for i in range(N):
-            for j in range(i + 1, N):
-                if abs(i - j) > 1 and not (closed and {i, j} == {0, N - 1}):
+        for i in range(n_seg):
+            for j in range(i + 1, n_seg):
+                if abs(i - j) > 1 and not (closed and {i, j} == {0, n_seg - 1}):
                     writhe += cls._segment_solid_angle(
                         coords[i], coords[i + 1], coords[j], coords[j + 1]
                     )
         return float(writhe)
 
     @classmethod
-    def compute_writhe_between_curves(
+    def _compute_writhe_single_curve_vectorized(
+        cls,
+        coords: np.ndarray,
+        closed: bool = True,
+        block_size: int = 128,
+    ) -> float:
+        coords = np.asarray(coords, dtype=np.float64)
+        N = len(coords)
+        n_seg = N if closed else max(N - 1, 0)
+        if n_seg < 3:
+            return 0.0
+
+        p1 = coords[:n_seg]
+        p2 = np.roll(coords, -1, axis=0)[:n_seg] if closed else coords[1 : n_seg + 1]
+
+        writhe = 0.0
+        for i0 in range(0, n_seg, block_size):
+            i1 = min(i0 + block_size, n_seg)
+            i_idx = np.arange(i0, i1)[:, None]
+            for j0 in range(i0, n_seg, block_size):
+                j1 = min(j0 + block_size, n_seg)
+                j_idx = np.arange(j0, j1)[None, :]
+                mask = (j_idx - i_idx) > 1
+                if closed:
+                    mask &= ~((i_idx == 0) & (j_idx == n_seg - 1))
+                ii, jj = np.nonzero(mask)
+                if ii.size == 0:
+                    continue
+                pair_vals = cls._segment_solid_angle_batch(
+                    p1[i0 + ii], p2[i0 + ii], p1[j0 + jj], p2[j0 + jj]
+                )
+                writhe += float(np.sum(pair_vals))
+        return float(writhe)
+
+    @classmethod
+    def compute_writhe_single_curve(
+        cls,
+        coords: np.ndarray,
+        closed: bool = True,
+        method: str = "vectorized",
+    ) -> float:
+        if method == "vectorized":
+            return cls._compute_writhe_single_curve_vectorized(coords, closed=closed)
+        if method == "legacy":
+            return cls._compute_writhe_single_curve_legacy(coords, closed=closed)
+        raise ValueError("method must be 'vectorized' or 'legacy'")
+
+    @classmethod
+    def _compute_writhe_between_curves_legacy(
         cls,
         curve1: np.ndarray,
         curve2: np.ndarray,
     ) -> float:
-        """
-        Computes the writhe between two closed curves (curve1 and curve2).
-
-        Parameters
-        ----------
-        curve1, curve2 : ndarray of shape (N, 3) and (M, 3)
-            Points defining the closed curves C1 and C2.
-
-        Returns
-        -------
-        float
-            The computed writhe between the two curves.
-        """
         N, M = len(curve1), len(curve2)
-
-        # Ensure curves are closed by appending the first point at the end
         curve1_closed = np.vstack([curve1, curve1[0]])
         curve2_closed = np.vstack([curve2, curve2[0]])
 
@@ -227,17 +307,80 @@ class Analyzer:
         return float(writhe)
 
     @classmethod
+    def _compute_writhe_between_curves_vectorized(
+        cls,
+        curve1: np.ndarray,
+        curve2: np.ndarray,
+        block_size: int = 128,
+    ) -> float:
+        curve1 = np.asarray(curve1, dtype=np.float64)
+        curve2 = np.asarray(curve2, dtype=np.float64)
+        N, M = len(curve1), len(curve2)
+        if N == 0 or M == 0:
+            return 0.0
+
+        p1 = curve1
+        p2 = np.roll(curve1, -1, axis=0)
+        q1 = curve2
+        q2 = np.roll(curve2, -1, axis=0)
+
+        writhe = 0.0
+        for i0 in range(0, N, block_size):
+            i1 = min(i0 + block_size, N)
+            for j0 in range(0, M, block_size):
+                j1 = min(j0 + block_size, M)
+                pair_vals = cls._segment_solid_angle_batch(
+                    p1[i0:i1][:, None, :],
+                    p2[i0:i1][:, None, :],
+                    q1[j0:j1][None, :, :],
+                    q2[j0:j1][None, :, :],
+                )
+                writhe += float(np.sum(pair_vals))
+        return float(writhe)
+
+    @classmethod
+    def compute_writhe_between_curves(
+        cls,
+        curve1: np.ndarray,
+        curve2: np.ndarray,
+        method: str = "vectorized",
+    ) -> float:
+        """
+        Computes the writhe between two closed curves (curve1 and curve2).
+
+        Parameters
+        ----------
+        curve1, curve2 : ndarray of shape (N, 3) and (M, 3)
+            Points defining the closed curves C1 and C2.
+        method : {'vectorized', 'legacy'}, default 'vectorized'
+            Computation implementation to use.
+
+        Returns
+        -------
+        float
+            The computed writhe between the two curves.
+        """
+        if method == "vectorized":
+            return cls._compute_writhe_between_curves_vectorized(curve1, curve2)
+        if method == "legacy":
+            return cls._compute_writhe_between_curves_legacy(curve1, curve2)
+        raise ValueError("method must be 'vectorized' or 'legacy'")
+
+    @classmethod
     def compute_writhe_trajectory(
         cls,
         trajectory: np.ndarray,
         closed: bool = True,
         processes: Optional[int] = None,
+        method: str = "vectorized",
     ) -> List[float]:
+        if method not in {"vectorized", "legacy"}:
+            raise ValueError("method must be 'vectorized' or 'legacy'")
         if processes is None:
             processes = max(cpu_count() - 1, 1)
 
         with Pool(processes) as pool:
-            args = [(frame, closed) for frame in trajectory]
+            args = [(frame, closed, method) for frame in trajectory]
             results = pool.starmap(cls.compute_writhe_single_curve, args)
 
         return results
@@ -247,7 +390,7 @@ class Analyzer:
         positions: np.ndarray, 
         return_components: bool = False,
         bead_masses: Optional[np.ndarray] = None,
-        print_choice: bool = True,
+        print_choice: bool = False,
     ) -> Union[float, np.ndarray, Tuple]:
         """
         Calculates the Radius of Gyration (Rg).
@@ -265,11 +408,11 @@ class Analyzer:
         if bead_masses is not None:
             masses = np.asarray(bead_masses)
             if print_choice:
-                print("Computing mass-weighted Radius of Gyration")
+                logger.info("Computing mass-weighted Radius of Gyration")
         else:
             masses = np.ones(positions.shape[-2])
             if print_choice:
-                print("Computing geometric Radius of Gyration (uniform mass)")
+                logger.info("Computing geometric Radius of Gyration (uniform mass)")
 
         # ---------------------------------------------------------
         # Case 1: Single Frame (N, 3)
@@ -425,7 +568,7 @@ class Analyzer:
         # ---- Select compute backend ----
         use_gpu = (device.lower() == 'gpu')
         if use_gpu and not CUPY_AVAILABLE:
-            print("CuPy not available. Falling back to CPU.")
+            logger.warning("CuPy not available. Falling back to CPU.")
             use_gpu = False
         xp = cp if use_gpu else np
 
@@ -643,13 +786,10 @@ class Analyzer:
         Dict[str, np.ndarray]
             VACF curves for 'general' and each bead type.
         """
-        # Determine platform
         use_gpu = Analyzer._check_platform(platform)
-
-        if use_gpu:
-            return Analyzer._calculate_vacf_gpu(velocities, bead_types, sampling_step)
-        else:
-            return Analyzer._calculate_vacf_cpu(velocities, bead_types, sampling_step)
+        return Analyzer._calculate_vacf_impl(
+            velocities, bead_types, sampling_step, use_gpu=use_gpu
+        )
 
     # =========================================================================
     # Public Interface: Spatial Velocity Correlation
@@ -693,15 +833,16 @@ class Analyzer:
             Correlation curves and 'bin_centers'.
         """
         use_gpu = Analyzer._check_platform(platform)
-
-        if use_gpu:
-            return Analyzer._calculate_spatial_vel_corr_gpu(
-                coords, velocities, bead_types, dist_range, sampling_step, num_bins, chunk_size
-            )
-        else:
-            return Analyzer._calculate_spatial_vel_corr_cpu(
-                coords, velocities, bead_types, dist_range, sampling_step, num_bins, chunk_size
-            )
+        return Analyzer._calculate_spatial_vel_corr_impl(
+            coords,
+            velocities,
+            bead_types,
+            dist_range,
+            sampling_step=sampling_step,
+            num_bins=num_bins,
+            chunk_size=chunk_size,
+            use_gpu=use_gpu,
+        )
 
     # =========================================================================
     # Helper: Platform Check
@@ -728,95 +869,265 @@ class Analyzer:
             return False
 
     # =========================================================================
-    # Backend Implementation: VACF (GPU)
+    # Unified Backend Implementation: VACF (CPU / GPU)
     # =========================================================================
+
+    @staticmethod
+    def _autocorr_fft(x_multi_dim, use_gpu: bool = False):
+        """FFT-based autocorrelation helper shared by CPU and GPU backends."""
+        N = x_multi_dim.shape[0]
+        if N == 0:
+            return x_multi_dim.copy()
+        xp = cp if use_gpu else np
+        is_complex = bool(xp.iscomplexobj(x_multi_dim))
+
+        if use_gpu:
+            n_fft = next_fast_len(2 * N)
+            if is_complex:
+                F = cp.fft.fft(x_multi_dim, n=n_fft, axis=0)
+                res = cp.fft.ifft(F * F.conjugate(), axis=0)[:N, ...].real
+            else:
+                F = cp.fft.rfft(x_multi_dim, n=n_fft, axis=0)
+                res = cp.fft.irfft(F.real**2 + F.imag**2, n=n_fft, axis=0)[:N, ...]
+        else:
+            n_fft = next_fast_len(2 * N, real=not is_complex)
+            if is_complex:
+                F = np.fft.fft(x_multi_dim, n=n_fft, axis=0)
+                res = np.fft.ifft(F * F.conjugate(), axis=0)[:N, ...].real
+            else:
+                F = sp_rfft(x_multi_dim, n=n_fft, axis=0, workers=-1)
+                res = sp_irfft(
+                    F.real**2 + F.imag**2, n=n_fft, axis=0, workers=-1
+                )[:N, ...]
+
+        norm_shape = [N] + [1] * (x_multi_dim.ndim - 1)
+        norm = (N - xp.arange(0, N)).reshape(norm_shape)
+        return res / norm
 
     @staticmethod
     def _autocorrFFT_gpu(x_multi_dim: "cp.ndarray") -> "cp.ndarray":
         """(GPU) FFT-based autocorrelation helper."""
-        N = x_multi_dim.shape[0]
-        F = cp.fft.fft(x_multi_dim, n=2 * N, axis=0)
-        res = cp.fft.ifft(F * F.conjugate(), axis=0)
-        res = res[:N, ...].real
+        return Analyzer._autocorr_fft(x_multi_dim, use_gpu=True)
 
-        norm_shape = [N] + [1] * (x_multi_dim.ndim - 1)
-        norm = (N - cp.arange(0, N)).reshape(norm_shape)
-        return res / norm
+    @staticmethod
+    def _autocorrFFT_cpu(x_multi_dim: np.ndarray) -> np.ndarray:
+        """(CPU) FFT-based autocorrelation helper."""
+        return Analyzer._autocorr_fft(x_multi_dim, use_gpu=False)
+
+    @staticmethod
+    def _calculate_vacf_impl(
+        velocities: np.ndarray,
+        bead_types: np.ndarray,
+        sampling_step: int,
+        use_gpu: bool = False,
+    ) -> Dict[str, np.ndarray]:
+        """Shared CPU/GPU implementation of VACF."""
+        logger.info("Calculating VACF on %s...", "GPU" if use_gpu else "CPU")
+        xp = cp if use_gpu else np
+        bead_types_arr = np.asarray(bead_types)
+        type_indices = {
+            utype: np.where(bead_types_arr == utype)[0]
+            for utype in np.unique(bead_types_arr)
+        }
+
+        sampled_vels = xp.asarray(velocities[::sampling_step])
+        N = sampled_vels.shape[0]
+        if N == 0:
+            vacf_all_beads = xp.empty((sampled_vels.shape[1], 0), dtype=xp.float64)
+        elif xp.iscomplexobj(sampled_vels):
+            vacf_components = Analyzer._autocorr_fft(sampled_vels, use_gpu=use_gpu)
+            vacf_all_beads = xp.sum(vacf_components, axis=2).T
+        else:
+            if use_gpu:
+                n_fft = next_fast_len(2 * N)
+                F = cp.fft.rfft(sampled_vels, n=n_fft, axis=0)
+                power_sum = cp.sum(F.real**2 + F.imag**2, axis=2)
+                vacf_sum = cp.fft.irfft(power_sum, n=n_fft, axis=0)[:N, :]
+            else:
+                n_fft = next_fast_len(2 * N, real=True)
+                F = sp_rfft(sampled_vels, n=n_fft, axis=0, workers=-1)
+                power_sum = np.sum(F.real**2 + F.imag**2, axis=2)
+                vacf_sum = sp_irfft(power_sum, n=n_fft, axis=0, workers=-1)[:N, :]
+            norm = (N - xp.arange(0, N))[:, None]
+            vacf_all_beads = (vacf_sum / norm).T
+
+        results_xp = {"general": xp.mean(vacf_all_beads, axis=0)}
+        for btype, indices in type_indices.items():
+            if len(indices) > 0:
+                idx_xp = xp.asarray(indices) if use_gpu else indices
+                results_xp[btype] = xp.mean(vacf_all_beads[idx_xp, :], axis=0)
+
+        if use_gpu:
+            results = {k: cp.asnumpy(v) for k, v in results_xp.items()}
+            del sampled_vels, vacf_all_beads, results_xp
+            if hasattr(cp, "get_default_memory_pool"):
+                cp.get_default_memory_pool().free_all_blocks()
+            return results
+        return results_xp
 
     @staticmethod
     def _calculate_vacf_gpu(velocities, bead_types, sampling_step):
         """(GPU) Implementation of VACF."""
-        print("Calculating VACF on GPU...")
-        type_indices = {
-            utype: np.where(bead_types == utype)[0] for utype in np.unique(bead_types)
-        }
-
-        # Transfer to GPU
-        sampled_vels_cp = cp.asarray(velocities[::sampling_step])
-
-        # FFT Autocorrelation
-        vacf_components_cp = Analyzer._autocorrFFT_gpu(sampled_vels_cp)
-
-        # Sum components (x+y+z) -> (Time, Beads) -> Transpose to (Beads, Time)
-        vacf_all_beads_cp = cp.sum(vacf_components_cp, axis=2).T
-
-        results_cp = {}
-        results_cp["general"] = cp.mean(vacf_all_beads_cp, axis=0)
-
-        # Transfer indices for slicing
-        for btype, indices in type_indices.items():
-            if len(indices) > 0:
-                indices_cp = cp.asarray(indices)
-                results_cp[btype] = cp.mean(vacf_all_beads_cp[indices_cp, :], axis=0)
-
-        # Transfer back
-        return {k: cp.asnumpy(v) for k, v in results_cp.items()}
-
-    # =========================================================================
-    # Backend Implementation: VACF (CPU)
-    # =========================================================================
-
-    @staticmethod
-    def _autocorrFFT_cpu(x_multi_dim: np.ndarray) -> np.ndarray:
-        """(CPU) FFT-based autocorrelation helper using NumPy."""
-        N = x_multi_dim.shape[0]
-        # Use numpy.fft
-        F = np.fft.fft(x_multi_dim, n=2 * N, axis=0)
-        res = np.fft.ifft(F * F.conjugate(), axis=0)
-        res = res[:N, ...].real
-
-        norm_shape = [N] + [1] * (x_multi_dim.ndim - 1)
-        norm = (N - np.arange(0, N)).reshape(norm_shape)
-        return res / norm
+        return Analyzer._calculate_vacf_impl(
+            velocities, bead_types, sampling_step, use_gpu=True
+        )
 
     @staticmethod
     def _calculate_vacf_cpu(velocities, bead_types, sampling_step):
-        """(CPU) Implementation of VACF using NumPy."""
-        print("Calculating VACF on CPU...")
-        type_indices = {
-            utype: np.where(bead_types == utype)[0] for utype in np.unique(bead_types)
-        }
+        """(CPU) Implementation of VACF."""
+        return Analyzer._calculate_vacf_impl(
+            velocities, bead_types, sampling_step, use_gpu=False
+        )
 
-        sampled_vels = velocities[::sampling_step]
+    # =========================================================================
+    # Unified Backend Implementation: Spatial Velocity Correlation (CPU / GPU)
+    # =========================================================================
 
-        # FFT Autocorrelation
-        vacf_components = Analyzer._autocorrFFT_cpu(sampled_vels)
+    @staticmethod
+    def _calculate_spatial_vel_corr_impl(
+        coords: np.ndarray,
+        velocities: np.ndarray,
+        bead_types: np.ndarray,
+        dist_range: float,
+        sampling_step: int = 1,
+        num_bins: int = 100,
+        chunk_size: Optional[int] = None,
+        use_gpu: bool = False,
+    ) -> Dict[str, np.ndarray]:
+        """Vectorized CPU/GPU spatial velocity correlation without inner Python pair loops."""
+        logger.info(
+            "Calculating Spatial Velocity Correlation on %s...",
+            "GPU" if use_gpu else "CPU",
+        )
+        xp = cp if use_gpu else np
 
-        # Sum components
-        vacf_all_beads = np.sum(vacf_components, axis=2).T
+        n_frames, n_beads, _ = coords.shape
+        bins = np.linspace(0, dist_range, num_bins + 1, dtype=np.float32)
+        bin_centers = (bins[:-1] + bins[1:]) / 2.0
 
-        results = {}
-        results["general"] = np.mean(vacf_all_beads, axis=0)
+        bead_types_arr = np.asarray(bead_types)
+        if bead_types_arr.shape[0] != n_beads:
+            raise ValueError(
+                f"bead_types length ({bead_types_arr.shape[0]}) must match number of beads ({n_beads})."
+            )
 
-        for btype, indices in type_indices.items():
-            if len(indices) > 0:
-                results[btype] = np.mean(vacf_all_beads[indices, :], axis=0)
+        unique_types, type_ids = np.unique(bead_types_arr, return_inverse=True)
+        type_ids = type_ids.ravel().astype(np.int32)
+        type_strs = [str(t) for t in unique_types]
+        n_types = len(type_strs)
+        type_pairs = sorted(
+            {
+                "-".join(sorted((type_strs[a], type_strs[b])))
+                for a in range(n_types)
+                for b in range(a, n_types)
+            }
+        )
+        n_pairs = len(type_pairs)
+        pair_to_id = {key: idx for idx, key in enumerate(type_pairs)}
+        pair_lut = np.empty((n_types, n_types), dtype=np.int32)
+        for a in range(n_types):
+            for b in range(n_types):
+                pair_lut[a, b] = pair_to_id["-".join(sorted((type_strs[a], type_strs[b])))]
 
+        if chunk_size is None:
+            chunk_size = n_beads
+        elif not isinstance(chunk_size, (int, np.integer)) or chunk_size < 1:
+            raise ValueError("chunk_size must be a positive integer.")
+
+        bins_xp = xp.asarray(bins)
+        bin_edges_right = bins_xp[1:]
+        type_ids_xp = xp.asarray(type_ids)
+        pair_lut_xp = xp.asarray(pair_lut)
+        pair_corr = xp.zeros((n_pairs, num_bins), dtype=xp.float64)
+        pair_counts = xp.zeros((n_pairs, num_bins), dtype=xp.int64)
+        total_buckets = n_pairs * num_bins
+
+        if n_beads >= 2 and n_pairs > 0 and dist_range > 0:
+            for frame_idx in range(0, n_frames, sampling_step):
+                if use_gpu:
+                    frame_coords = cp.asarray(coords[frame_idx], dtype=cp.float32)
+                    frame_vels = cp.asarray(velocities[frame_idx], dtype=cp.float32)
+                else:
+                    frame_coords = np.asarray(coords[frame_idx])
+                    frame_vels = np.asarray(velocities[frame_idx])
+
+                for start_i in range(0, n_beads, chunk_size):
+                    end_i = min(start_i + chunk_size, n_beads)
+                    coords_i = frame_coords[start_i:end_i]
+                    vels_i = frame_vels[start_i:end_i]
+                    row_global_base = xp.arange(start_i, end_i)[:, None]
+
+                    for start_j in range(start_i, n_beads, chunk_size):
+                        end_j = min(start_j + chunk_size, n_beads)
+                        coords_j = frame_coords[start_j:end_j]
+                        vels_j = frame_vels[start_j:end_j]
+
+                        dists = xp.linalg.norm(
+                            coords_i[:, None, :] - coords_j[None, :, :], axis=2
+                        )
+                        dots = vels_i @ vels_j.T
+                        valid = dists < bins_xp[-1]
+                        if start_j == start_i:
+                            col_global_base = xp.arange(start_j, end_j)[None, :]
+                            valid &= row_global_base < col_global_base
+
+                        rows, cols = xp.nonzero(valid)
+                        if rows.size == 0:
+                            continue
+
+                        d_val = dists[rows, cols]
+                        v_val = dots[rows, cols]
+                        b_idx = xp.searchsorted(bin_edges_right, d_val, side="right")
+                        in_range = b_idx < num_bins
+                        rows = rows[in_range]
+                        cols = cols[in_range]
+                        b_idx = b_idx[in_range]
+                        v_val = v_val[in_range]
+                        if rows.size == 0:
+                            continue
+
+                        p_idx = pair_lut_xp[
+                            type_ids_xp[start_i + rows], type_ids_xp[start_j + cols]
+                        ]
+                        flat_idx = p_idx * num_bins + b_idx
+                        pair_corr += xp.bincount(
+                            flat_idx,
+                            weights=v_val.astype(xp.float64),
+                            minlength=total_buckets,
+                        ).reshape(n_pairs, num_bins)
+                        pair_counts += xp.bincount(
+                            flat_idx, minlength=total_buckets
+                        ).reshape(n_pairs, num_bins)
+
+        if use_gpu:
+            pair_corr_np = cp.asnumpy(pair_corr)
+            pair_counts_np = cp.asnumpy(pair_counts)
+            del bins_xp, type_ids_xp, pair_lut_xp, pair_corr, pair_counts
+            if hasattr(cp, "get_default_memory_pool"):
+                cp.get_default_memory_pool().free_all_blocks()
+        else:
+            pair_corr_np = pair_corr
+            pair_counts_np = pair_counts
+
+        general_corr = np.sum(pair_corr_np, axis=0)
+        general_counts = np.sum(pair_counts_np, axis=0)
+
+        results: Dict[str, np.ndarray] = {}
+        with np.errstate(divide="ignore", invalid="ignore"):
+            gen = general_corr / general_counts
+        gen[general_counts == 0] = np.nan
+        results["general"] = gen
+
+        for idx, key in enumerate(type_pairs):
+            cnt = pair_counts_np[idx]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                corr = pair_corr_np[idx] / cnt
+            corr[cnt == 0] = np.nan
+            results[key] = corr
+
+        results["bin_centers"] = bin_centers
         return results
 
-    # =========================================================================
-    # Backend Implementation: Spatial Corr (GPU)
-    # =========================================================================
     @staticmethod
     def _calculate_spatial_vel_corr_gpu(
         coords: np.ndarray,
@@ -827,345 +1138,140 @@ class Analyzer:
         num_bins: int = 50,
         chunk_size: Optional[int] = None,
     ) -> Dict[str, np.ndarray]:
-        """
-        (Vectorized, GPU) calculate spatial velocity correlation C(r) = <v_i · v_j>.
-
-        In CPU, loop over frames, but calculate all O(N^2) on GPU.
-        Optional batching over particles with chunk_size guards against GPU OOM.
-        """
-        print("Calculating Spatial Correlation on GPU...")
-        n_frames, n_beads, _ = coords.shape
-
-        # 1. set Bins and type pairs (lightweight on CPU)
-        bins = np.linspace(0, dist_range, num_bins + 1, dtype=np.float32)
-        bin_centers = (bins[:-1] + bins[1:]) / 2.0
-
-        unique_types = np.unique(bead_types)
-        type_pairs = [
-            "-".join(sorted(pair))
-            for pair in np.array(np.meshgrid(unique_types, unique_types)).T.reshape(
-                -1, 2
-            )
-        ]
-        type_pairs = sorted(list(set(type_pairs)))
-
-        bins_cp = cp.asarray(bins)
-
-        # 3. RATIONALE: initialize accumulators on GPU
-        total_corr_cp = {key: cp.zeros(num_bins) for key in ["general"] + type_pairs}
-        counts_cp = {key: cp.zeros(num_bins) for key in ["general"] + type_pairs}
-
-        if chunk_size is None:
-            chunk_size = n_beads
-
-        # 4. loop over sampled frames on CPU
-        for frame_idx in range(0, n_frames, sampling_step):
-
-            # 5. RATIONALE: transfer *only the current frame* to GPU
-            frame_coords_cp = cp.asarray(coords[frame_idx], dtype=cp.float32)
-            frame_vels_cp = cp.asarray(velocities[frame_idx], dtype=cp.float32)
-
-            for start_i in range(0, n_beads, chunk_size):
-                end_i = min(start_i + chunk_size, n_beads)
-
-                # Distance matrix block: (chunk_size, n_beads)
-                coords_i = frame_coords_cp[start_i:end_i]
-                dist_matrix_block = cp.linalg.norm(
-                    coords_i[:, None, :] - frame_coords_cp[None, :, :], axis=2
-                )
-
-                # VdotV block: (chunk_size, n_beads)
-                vels_i = frame_vels_cp[start_i:end_i]
-                v_dot_v_block = vels_i @ frame_vels_cp.T
-
-                # Extract upper triangle parts only to avoid double counting and self-correlation
-                for i_local in range(end_i - start_i):
-                    i_global = start_i + i_local
-                    if i_global + 1 >= n_beads:
-                        break
-
-                    # Slicing from i_global+1 to end for upper triangle
-                    all_dists_cp = dist_matrix_block[i_local, i_global + 1 :]
-                    all_dots_cp = v_dot_v_block[i_local, i_global + 1 :]
-
-                    # d. digitize
-                    all_bin_indices_cp = cp.digitize(all_dists_cp, bins_cp[1:])
-
-                    # 7. RATIONALE: use bincount on GPU for vectorized accumulation
-                    valid_mask_cp = all_bin_indices_cp < num_bins
-
-                    # accumulate 'general'
-                    valid_bins_cp = all_bin_indices_cp[valid_mask_cp]
-                    valid_dots_cp = all_dots_cp[valid_mask_cp]
-
-                    if valid_bins_cp.size > 0:
-                        total_corr_cp["general"] += cp.bincount(
-                            valid_bins_cp, weights=valid_dots_cp, minlength=num_bins
-                        )
-                        counts_cp["general"] += cp.bincount(valid_bins_cp, minlength=num_bins)
-
-                    bead_type_i = bead_types[i_global]
-                    bead_types_j = bead_types[i_global + 1 :]
-
-                    for key in type_pairs:
-                        t1, t2 = key.split("-")
-
-                        if t1 == t2:
-                            type_mask = (bead_type_i == t1) & (bead_types_j == t2)
-                        else:
-                            type_mask = ((bead_type_i == t1) & (bead_types_j == t2)) | (
-                                (bead_type_i == t2) & (bead_types_j == t1)
-                            )
-                        type_mask_cp = cp.asarray(type_mask)
-
-                        final_mask_cp = valid_mask_cp & type_mask_cp
-                        if cp.any(final_mask_cp):
-                            type_bins_cp = all_bin_indices_cp[final_mask_cp]
-                            type_dots_cp = all_dots_cp[final_mask_cp]
-                            total_corr_cp[key] += cp.bincount(
-                                type_bins_cp, weights=type_dots_cp, minlength=num_bins
-                            )
-                            counts_cp[key] += cp.bincount(type_bins_cp, minlength=num_bins)
-
-        # 8. calculate final average on GPU
-        results_cp = {}
-        for key in total_corr_cp:
-
-            # replace where to be compatible with old version of cupy
-
-            # 1. copy counts to avoid modifying original accumulators
-            counts_safe_cp = counts_cp[key].copy()
-
-            # 2. create mask for all bins with count 0
-            zero_mask_cp = counts_safe_cp == 0
-
-            # 3. replace these 0s with 1.0. This doesn't affect the result,
-            #    because we will set these positions to NaN later.
-            counts_safe_cp[zero_mask_cp] = 1.0
-
-            # 4. perform regular division (now safe)
-            corr_cp = total_corr_cp[key] / counts_safe_cp
-
-            # 5. set positions marked as 0 to NaN
-            corr_cp[zero_mask_cp] = cp.nan
-
-            results_cp[key] = corr_cp
-
-        # 9. transfer final small result array back to CPU
-        results_np = {k: cp.asnumpy(v) for k, v in results_cp.items()}
-        results_np["bin_centers"] = bin_centers
-
-        return results_np
-
-    # =========================================================================
-    # Backend Implementation: Spatial Corr (CPU)
-    # =========================================================================
+        """(GPU) Spatial velocity correlation wrapper."""
+        return Analyzer._calculate_spatial_vel_corr_impl(
+            coords,
+            velocities,
+            bead_types,
+            dist_range,
+            sampling_step=sampling_step,
+            num_bins=num_bins,
+            chunk_size=chunk_size,
+            use_gpu=True,
+        )
 
     @staticmethod
     def _calculate_spatial_vel_corr_cpu(
         coords, velocities, bead_types, dist_range, sampling_step, num_bins, chunk_size=None
     ):
-        """(CPU) Vectorized spatial velocity correlation using NumPy with optional batching."""
-        print("Calculating Spatial Velocity Correlation on CPU...")
-
-        n_frames, n_beads, _ = coords.shape
-        bins = np.linspace(0, dist_range, num_bins + 1, dtype=np.float32)
-        bin_centers = (bins[:-1] + bins[1:]) / 2.0
-
-        unique_types = np.unique(bead_types)
-        type_pairs = sorted(
-            list(
-                set(
-                    [
-                        "-".join(sorted(pair))
-                        for pair in np.array(
-                            np.meshgrid(unique_types, unique_types)
-                        ).T.reshape(-1, 2)
-                    ]
-                )
-            )
+        """(CPU) Spatial velocity correlation wrapper."""
+        return Analyzer._calculate_spatial_vel_corr_impl(
+            coords,
+            velocities,
+            bead_types,
+            dist_range,
+            sampling_step=sampling_step,
+            num_bins=num_bins,
+            chunk_size=chunk_size,
+            use_gpu=False,
         )
 
-        total_corr = {key: np.zeros(num_bins) for key in ["general"] + type_pairs}
-        counts = {key: np.zeros(num_bins) for key in ["general"] + type_pairs}
+    @staticmethod
+    def _msd_fft_batch(
+        coords: np.ndarray,
+        batch_size: int,
+        use_gpu: bool = False,
+        free_gpu_pool: bool = True,
+    ) -> np.ndarray:
+        """
+        Shared CPU/GPU FFT-based MSD computation.
 
-        if chunk_size is None:
-            chunk_size = n_beads
+        Subtracts each bead's initial position in float64 before FFT/prefix-sum
+        evaluation and accumulates S1 in float64 to avoid catastrophic cancellation
+        on trajectories with large coordinate offsets or long runs.
+        """
+        M, B_total, D = coords.shape
+        out_dtype = np.result_type(coords.dtype, np.float32)
+        if M == 0 or B_total == 0:
+            return np.empty((M, B_total), dtype=out_dtype)
 
-        # Loop over frames
-        for frame_idx in range(0, n_frames, sampling_step):
-            frame_coords = coords[frame_idx]  # (N, 3)
-            frame_vels = velocities[frame_idx]  # (N, 3)
+        msd_result = np.zeros((M, B_total), dtype=out_dtype)
+        if M == 1:
+            return msd_result
 
-            for start_i in range(0, n_beads, chunk_size):
-                end_i = min(start_i + chunk_size, n_beads)
+        xp = cp if use_gpu else np
+        n_fft = next_fast_len(2 * M) if use_gpu else next_fast_len(2 * M, real=True)
+        den = (M - np.arange(M, dtype=np.float64))[:, None]
+        den_xp = xp.asarray(den) if use_gpu else den
+        zero_pad = xp.zeros((1, 1), dtype=xp.float64)
 
-                # Distance matrix block: (chunk_size, n_beads)
-                coords_i = frame_coords[start_i:end_i]
-                dist_matrix_block = np.linalg.norm(
-                    coords_i[:, None, :] - frame_coords[None, :, :], axis=2
+        try:
+            for start_idx in range(0, B_total, batch_size):
+                end_idx = min(start_idx + batch_size, B_total)
+                r_batch_f64 = np.asarray(
+                    coords[:, start_idx:end_idx, :], dtype=np.float64
                 )
+                # Shift by frame 0 in float64 so large global offsets do not cancel displacements.
+                r_shifted_np = r_batch_f64 - r_batch_f64[0:1, :, :]
+                B_current = r_shifted_np.shape[1]
 
-                # VdotV block: (chunk_size, n_beads)
-                vels_i = frame_vels[start_i:end_i]
-                v_dot_v_block = vels_i @ frame_vels.T
-
-                # Extract upper triangle parts only to avoid double counting and self-correlation
-                for i_local in range(end_i - start_i):
-                    i_global = start_i + i_local
-                    if i_global + 1 >= n_beads:
-                        break
-
-                    # Slicing from i_global+1 to end for upper triangle
-                    all_dists = dist_matrix_block[i_local, i_global + 1 :]
-                    all_dots = v_dot_v_block[i_local, i_global + 1 :]
-
-                    all_bin_indices = np.digitize(all_dists, bins[1:])
-                    valid_mask = all_bin_indices < num_bins
-
-                    valid_bins = all_bin_indices[valid_mask]
-                    valid_dots = all_dots[valid_mask]
-
-                    if valid_bins.size > 0:
-                        total_corr["general"] += np.bincount(
-                            valid_bins, weights=valid_dots, minlength=num_bins
+                if use_gpu:
+                    r_shifted_gpu = cp.asarray(r_shifted_np, dtype=cp.float32)
+                    power_sum = cp.zeros(
+                        (n_fft // 2 + 1, B_current), dtype=cp.float32
+                    )
+                    for dim in range(D):
+                        F = cp.fft.rfft(r_shifted_gpu[:, :, dim], n=n_fft, axis=0)
+                        power_sum += F.real**2 + F.imag**2
+                    S2 = (
+                        cp.fft.irfft(power_sum, n=n_fft, axis=0)[:M, :].astype(
+                            cp.float64
                         )
-                        counts["general"] += np.bincount(valid_bins, minlength=num_bins)
+                        / den_xp
+                    )
+                    D_sq = cp.sum(r_shifted_gpu.astype(cp.float64) ** 2, axis=2)
+                else:
+                    F = sp_rfft(r_shifted_np, n=n_fft, axis=0, workers=-1)
+                    power_sum = np.sum(F.real**2 + F.imag**2, axis=2)
+                    S2 = sp_irfft(power_sum, n=n_fft, axis=0, workers=-1)[:M, :] / den_xp
+                    D_sq = np.sum(r_shifted_np**2, axis=2)
 
-                    bead_type_i = bead_types[i_global]
-                    bead_types_j = bead_types[i_global + 1 :]
+                Q_0 = 2.0 * xp.sum(D_sq, axis=0)
+                sub_terms = D_sq[:-1, :] + D_sq[M - 1 : 0 : -1, :]
+                cum_sub = xp.cumsum(sub_terms, axis=0)
+                pad = xp.broadcast_to(zero_pad, (1, B_current))
+                Q_m = Q_0 - xp.concatenate((pad, cum_sub), axis=0)
+                S1 = Q_m / den_xp
 
-                    for key in type_pairs:
-                        t1, t2 = key.split("-")
+                msd_batch = S1 - 2.0 * S2
+                msd_batch[0, :] = 0.0
+                if use_gpu:
+                    msd_result[:, start_idx:end_idx] = cp.asnumpy(msd_batch).astype(
+                        out_dtype, copy=False
+                    )
+                    del (
+                        r_shifted_gpu,
+                        power_sum,
+                        F,
+                        S2,
+                        D_sq,
+                        sub_terms,
+                        cum_sub,
+                        Q_m,
+                        S1,
+                        msd_batch,
+                    )
+                else:
+                    msd_result[:, start_idx:end_idx] = msd_batch.astype(
+                        out_dtype, copy=False
+                    )
+        finally:
+            if use_gpu:
+                del den_xp, zero_pad
+                if free_gpu_pool and hasattr(cp, "get_default_memory_pool"):
+                    cp.get_default_memory_pool().free_all_blocks()
 
-                        if t1 == t2:
-                            type_mask = (bead_type_i == t1) & (bead_types_j == t2)
-                        else:
-                            type_mask = ((bead_type_i == t1) & (bead_types_j == t2)) | (
-                                (bead_type_i == t2) & (bead_types_j == t1)
-                            )
-
-                        final_mask = valid_mask & type_mask
-                        if np.any(final_mask):
-                            type_bins = all_bin_indices[final_mask]
-                            type_dots = all_dots[final_mask]
-                            total_corr[key] += np.bincount(
-                                type_bins, weights=type_dots, minlength=num_bins
-                            )
-                            counts[key] += np.bincount(type_bins, minlength=num_bins)
-
-        # Final Average
-        results = {}
-        for key in total_corr:
-            counts_safe = counts[key].copy()
-            # Safe division for CPU (avoiding runtime warnings)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                corr = total_corr[key] / counts_safe
-
-            # Set 0 counts to NaN
-            corr[counts_safe == 0] = np.nan
-            results[key] = corr
-
-        results["bin_centers"] = bin_centers
-        return results
+        return msd_result
 
     @staticmethod
     def _msd_fft_cpu_batch(coords: np.ndarray, batch_size: int) -> np.ndarray:
-        """
-        (Internal) CPU implementation of MSD using numpy.fft.
-        Motivation: Utilizes vectorized numpy operations and rFFT to avoid slow Python loops.
-        """
-        M, B_total, D = coords.shape
-        msd_result = np.zeros((M, B_total), dtype=np.float32)
-
-        # Pre-calculate denominator, shape (M, 1)
-        den = (M - np.arange(M, dtype=np.float32))[:, None]
-
-        for start_idx in range(0, B_total, batch_size):
-            end_idx = min(start_idx + batch_size, B_total)
-            # Convert to single-precision floating point to save memory and speed up
-            r_batch = coords[:, start_idx:end_idx, :].astype(np.float32)
-            B_current = r_batch.shape[1]
-
-            # --- Step 1: Cross Term S2 (Autocorrelation) ---
-            S2 = np.zeros((M, B_current), dtype=np.float32)
-            for dim in range(D):
-                r_1d = r_batch[:, :, dim]
-                # NumPy's rfft directly saves half of the complex calculation overhead
-                F = np.fft.rfft(r_1d, n=2 * M, axis=0)
-                power_spectrum = F.real**2 + F.imag**2
-                corr = np.fft.irfft(power_spectrum, n=2 * M, axis=0)[:M, :]
-                S2 += corr / den
-
-            # --- Step 2: Sum of Squares Term S1 (Prefix Sum Optimization) ---
-            D_sq = np.sum(r_batch**2, axis=2)
-            Q_0 = 2.0 * np.sum(D_sq, axis=0)
-
-            sub_terms = D_sq[:-1, :] + D_sq[M - 1 : 0 : -1, :]
-            cum_sub = np.cumsum(sub_terms, axis=0)
-
-            zero_pad = np.zeros((1, B_current), dtype=np.float32)
-            Q_m = Q_0 - np.concatenate((zero_pad, cum_sub), axis=0)
-            S1 = Q_m / den
-
-            # --- Step 3: Combine Results ---
-            msd_result[:, start_idx:end_idx] = S1 - 2.0 * S2
-
-        return msd_result
+        """(Internal) CPU implementation of MSD using SciPy rFFT."""
+        return Analyzer._msd_fft_batch(coords, batch_size, use_gpu=False)
 
     @staticmethod
     def _msd_fft_gpu_batch(coords: np.ndarray, batch_size: int) -> np.ndarray:
-        """
-        (Internal) GPU implementation of MSD using cupy.fft.
-        Motivation: Offloads heavy FFT and prefix-sum calculations to CUDA cores.
-        """
-        M, B_total, D = coords.shape
-        msd_result = np.zeros((M, B_total), dtype=np.float32)
-        den_gpu = cp.asarray((M - np.arange(M, dtype=np.float32))[:, None])
-
-        for start_idx in range(0, B_total, batch_size):
-            end_idx = min(start_idx + batch_size, B_total)
-            r_gpu = cp.asarray(coords[:, start_idx:end_idx, :], dtype=cp.float32)
-            B_current = r_gpu.shape[1]
-
-            S2 = cp.zeros((M, B_current), dtype=cp.float32)
-            for dim in range(D):
-                r_1d = r_gpu[:, :, dim]
-                F = cp.fft.rfft(r_1d, n=2 * M, axis=0)
-                power_spectrum = F.real**2 + F.imag**2
-                corr = cp.fft.irfft(power_spectrum, n=2 * M, axis=0)[:M, :]
-                S2 += corr / den_gpu
-
-            D_sq = cp.sum(r_gpu**2, axis=2)
-            Q_0 = 2.0 * cp.sum(D_sq, axis=0)
-
-            sub_terms = D_sq[:-1, :] + D_sq[M - 1 : 0 : -1, :]
-            cum_sub = cp.cumsum(sub_terms, axis=0)
-
-            zero_pad = cp.zeros((1, B_current), dtype=cp.float32)
-            Q_m = Q_0 - cp.concatenate((zero_pad, cum_sub), axis=0)
-            S1 = Q_m / den_gpu
-
-            msd_batch = S1 - 2.0 * S2
-            msd_result[:, start_idx:end_idx] = cp.asnumpy(msd_batch)
-
-            # Free up memory
-            del (
-                r_gpu,
-                S2,
-                F,
-                power_spectrum,
-                corr,
-                D_sq,
-                sub_terms,
-                cum_sub,
-                Q_m,
-                S1,
-                msd_batch,
-            )
-            cp.get_default_memory_pool().free_all_blocks()
-
-        return msd_result
+        """(Internal) GPU implementation of MSD using CuPy rFFT."""
+        return Analyzer._msd_fft_batch(coords, batch_size, use_gpu=True)
 
     @staticmethod
     def compute_msd(
@@ -1200,26 +1306,17 @@ class Analyzer:
             raise ValueError("sampling_step must be a positive integer.")
 
         # 2. Platform Routing Logic
-        use_gpu = False
-        if platform == "gpu":
-            if CUPY_AVAILABLE:
-                use_gpu = True
-            else:
-                warnings.warn(
-                    "GPU requested but CuPy is not available. Falling back to CPU."
-                )
-        elif platform == "auto":
-            use_gpu = CUPY_AVAILABLE
+        use_gpu = Analyzer._check_platform(platform)
 
         positions = positions[::sampling_step, :, :]
 
         # 3. Execution
-        if use_gpu:
-            print(f"Computing MSD on GPU (Batch size: {batch_size})...")
-            return Analyzer._msd_fft_gpu_batch(positions, batch_size)
-        else:
-            print(f"Computing MSD on CPU (Batch size: {batch_size})...")
-            return Analyzer._msd_fft_cpu_batch(positions, batch_size)
+        logger.info(
+            "Computing MSD on %s (Batch size: %d)...",
+            "GPU" if use_gpu else "CPU",
+            batch_size,
+        )
+        return Analyzer._msd_fft_batch(positions, batch_size, use_gpu=use_gpu)
 
     @staticmethod
     def compute_msd_average(
@@ -1263,16 +1360,7 @@ class Analyzer:
         if platform not in ["auto", "cpu", "gpu"]:
             raise ValueError("Platform must be 'auto', 'cpu', or 'gpu'.")
 
-        use_gpu = False
-        if platform == "gpu":
-            if CUPY_AVAILABLE:
-                use_gpu = True
-            else:
-                warnings.warn(
-                    "GPU requested but CuPy is not available. Falling back to CPU."
-                )
-        elif platform == "auto":
-            use_gpu = CUPY_AVAILABLE
+        use_gpu = Analyzer._check_platform(platform)
 
         positions_sliced = positions[::sampling_step, :, :]
         n_frames, n_beads, _ = positions_sliced.shape
@@ -1290,34 +1378,40 @@ class Analyzer:
         type_sums: Dict[str, np.ndarray] = {}
         type_counts: Dict[str, int] = {}
 
-        print(
-            f"Computing averaged MSD on {'GPU' if use_gpu else 'CPU'} "
-            f"(Bead batch size: {batch_size})..."
+        logger.info(
+            "Computing averaged MSD on %s (Bead batch size: %d)...",
+            "GPU" if use_gpu else "CPU",
+            batch_size,
         )
 
-        for start_idx in range(0, n_beads, batch_size):
-            end_idx = min(start_idx + batch_size, n_beads)
-            coords_batch = positions_sliced[:, start_idx:end_idx, :]
-            if use_gpu:
-                msd_batch = Analyzer._msd_fft_gpu_batch(coords_batch, batch_size)
-            else:
-                msd_batch = Analyzer._msd_fft_cpu_batch(coords_batch, batch_size)
+        try:
+            for start_idx in range(0, n_beads, batch_size):
+                end_idx = min(start_idx + batch_size, n_beads)
+                coords_batch = positions_sliced[:, start_idx:end_idx, :]
+                msd_batch = Analyzer._msd_fft_batch(
+                    coords_batch, batch_size, use_gpu=use_gpu, free_gpu_pool=False
+                )
 
-            total_sum += np.sum(msd_batch, axis=1, dtype=np.float64)
-            total_count += msd_batch.shape[1]
+                total_sum += np.sum(msd_batch, axis=1, dtype=np.float64)
+                total_count += msd_batch.shape[1]
 
-            if bead_types is not None:
-                batch_types = bead_types[start_idx:end_idx]
-                for bead_type in np.unique(batch_types):
-                    label = str(bead_type)
-                    mask = batch_types == bead_type
-                    if label not in type_sums:
-                        type_sums[label] = np.zeros(n_frames, dtype=np.float64)
-                        type_counts[label] = 0
-                    type_sums[label] += np.sum(msd_batch[:, mask], axis=1, dtype=np.float64)
-                    type_counts[label] += int(np.sum(mask))
+                if bead_types is not None:
+                    batch_types = bead_types[start_idx:end_idx]
+                    for bead_type in np.unique(batch_types):
+                        label = str(bead_type)
+                        mask = batch_types == bead_type
+                        if label not in type_sums:
+                            type_sums[label] = np.zeros(n_frames, dtype=np.float64)
+                            type_counts[label] = 0
+                        type_sums[label] += np.sum(
+                            msd_batch[:, mask], axis=1, dtype=np.float64
+                        )
+                        type_counts[label] += int(np.sum(mask))
 
-            del msd_batch
+                del msd_batch
+        finally:
+            if use_gpu and hasattr(cp, "get_default_memory_pool"):
+                cp.get_default_memory_pool().free_all_blocks()
 
         type_msd = {
             label: type_sum / type_counts[label]
@@ -1428,7 +1522,10 @@ class Analyzer:
         n_frames, n_beads, n_dims = coords_sliced.shape
         
         # Select backend
-        xp = cp if device.lower() == 'gpu' and CUPY_AVAILABLE else np
+        use_gpu = device.lower() == 'gpu' and CUPY_AVAILABLE
+        if device.lower() == 'gpu' and not CUPY_AVAILABLE:
+            logger.warning("GPU requested but CuPy is not available. Falling back to CPU.")
+        xp = cp if use_gpu else np
 
         # Handle Center Coordinate
         if center is None:
@@ -1457,39 +1554,45 @@ class Analyzer:
         # accumulator
         distances_by_type_accumulator = defaultdict(list)
 
-        print(f"Starting {device.upper()} analysis (Fixed Center) with batch_size={batch_size}...")
-        print(f"Center coordinate: {center} (dims={n_dims})")
+        logger.info(
+            "Starting %s analysis (Fixed Center) with batch_size=%d...",
+            "GPU" if use_gpu else "CPU",
+            batch_size,
+        )
+        logger.info("Center coordinate: %s (dims=%d)", center, n_dims)
 
         # --- 2. Batch Processing Loop ---
-        for start in range(0, n_frames, batch_size):
-            end = min(start + batch_size, n_frames)
-            
-            # Load batch to device
-            batch_coords = xp.asarray(coords_sliced[start:end])
-
-            # A. Relative Coordinates using broadcasting
-            # batch_coords shape: (batch_size, n_beads, n_dims)
-            # center_xp shape: (n_dims,)
-            # Result shape: (batch_size, n_beads, n_dims)
-            centered_batch = batch_coords - center_xp
-
-            # B. L2 Norm along the last axis (spatial dimension)
-            # result shape: (batch_size, n_beads)
-            dist_batch = xp.linalg.norm(centered_batch, axis=-1)
-
-            # C. Collect data
-            for btype, indices in type_indices.items():
-                # Select distances for specific bead types and flatten
-                selected_dist = dist_batch[:, indices].ravel()
+        try:
+            for start in range(0, n_frames, batch_size):
+                end = min(start + batch_size, n_frames)
                 
-                if device.lower() == 'gpu':
-                    distances_by_type_accumulator[btype].append(cp.asnumpy(selected_dist))
-                else:
-                    distances_by_type_accumulator[btype].append(selected_dist)
+                # Load batch to device
+                batch_coords = xp.asarray(coords_sliced[start:end])
 
-            # VRAM management for GPU
-            if device.lower() == 'gpu':
-                del batch_coords, centered_batch, dist_batch
+                # A. Relative Coordinates using broadcasting
+                # batch_coords shape: (batch_size, n_beads, n_dims)
+                # center_xp shape: (n_dims,)
+                # Result shape: (batch_size, n_beads, n_dims)
+                centered_batch = batch_coords - center_xp
+
+                # B. L2 Norm along the last axis (spatial dimension)
+                # result shape: (batch_size, n_beads)
+                dist_batch = xp.linalg.norm(centered_batch, axis=-1)
+
+                # C. Collect data
+                for btype, indices in type_indices.items():
+                    # Select distances for specific bead types and flatten
+                    selected_dist = dist_batch[:, indices].ravel()
+                    
+                    if use_gpu:
+                        distances_by_type_accumulator[btype].append(cp.asnumpy(selected_dist))
+                    else:
+                        distances_by_type_accumulator[btype].append(selected_dist)
+
+                if use_gpu:
+                    del batch_coords, centered_batch, dist_batch
+        finally:
+            if use_gpu and hasattr(cp, "get_default_memory_pool"):
                 cp.get_default_memory_pool().free_all_blocks()
 
         # --- 3. Final Consolidation ---
@@ -1517,7 +1620,10 @@ class Analyzer:
             raise ValueError(f"coords_trajectory is empty after slicing with sampling_rate={sampling_rate}")
 
         n_frames, n_beads, _ = coords_sliced.shape
-        xp = cp if device.lower() == 'gpu' and CUPY_AVAILABLE else np # auto-switch
+        use_gpu = device.lower() == 'gpu' and CUPY_AVAILABLE
+        if device.lower() == 'gpu' and not CUPY_AVAILABLE:
+            logger.warning("GPU requested but CuPy is not available. Falling back to CPU.")
+        xp = cp if use_gpu else np
 
         if len(bead_types) != n_beads:
             raise ValueError(
@@ -1541,37 +1647,43 @@ class Analyzer:
         # accumulator
         distances_by_type_accumulator = defaultdict(list)
 
-        print(f"Starting {device.upper()} analysis with batch_size={batch_size}...")
+        logger.info(
+            "Starting %s analysis with batch_size=%d...",
+            "GPU" if use_gpu else "CPU",
+            batch_size,
+        )
 
         # --- 2. Batch Processing Loop ---
-        for start in range(0, n_frames, batch_size):
-            end = min(start + batch_size, n_frames)
-            # load batch to device
-            batch_coords = xp.asarray(coords_sliced[start:end])
+        try:
+            for start in range(0, n_frames, batch_size):
+                end = min(start + batch_size, n_frames)
+                # load batch to device
+                batch_coords = xp.asarray(coords_sliced[start:end])
 
-            # A. Calculate COM for each batch
-            # result shape: (batch_size, 3)
-            com_batch = xp.average(batch_coords, axis=1, weights=masses)
+                # A. Calculate COM for each batch
+                # result shape: (batch_size, 3)
+                com_batch = xp.average(batch_coords, axis=1, weights=masses)
 
-            # B. Relative Coordinates using broadcasting
-            # Motivation: com_batch[:, None, :] using broadcasting: (N, 3) -> (N, 1, 3)
-            centered_batch = batch_coords - com_batch[:, xp.newaxis, :]
+                # B. Relative Coordinates using broadcasting
+                # Motivation: com_batch[:, None, :] using broadcasting: (N, 3) -> (N, 1, 3)
+                centered_batch = batch_coords - com_batch[:, xp.newaxis, :]
 
-            # C. L2 Norm
-            # result shape: (batch_size, n_beads)
-            dist_batch = xp.linalg.norm(centered_batch, axis=2)
+                # C. L2 Norm
+                # result shape: (batch_size, n_beads)
+                dist_batch = xp.linalg.norm(centered_batch, axis=2)
 
-            # D. collect data
-            for btype, indices in type_indices.items():
-                selected_dist = dist_batch[:, indices].ravel()
-                if device.lower() == 'gpu':
-                    distances_by_type_accumulator[btype].append(cp.asnumpy(selected_dist))
-                else:
-                    distances_by_type_accumulator[btype].append(selected_dist)
+                # D. collect data
+                for btype, indices in type_indices.items():
+                    selected_dist = dist_batch[:, indices].ravel()
+                    if use_gpu:
+                        distances_by_type_accumulator[btype].append(cp.asnumpy(selected_dist))
+                    else:
+                        distances_by_type_accumulator[btype].append(selected_dist)
 
-            # VRAM management
-            if device.lower() == 'gpu':
-                del batch_coords, com_batch, centered_batch, dist_batch
+                if use_gpu:
+                    del batch_coords, com_batch, centered_batch, dist_batch
+        finally:
+            if use_gpu and hasattr(cp, "get_default_memory_pool"):
                 cp.get_default_memory_pool().free_all_blocks()
 
         # --- 3. Final Consolidation ---
@@ -1580,6 +1692,31 @@ class Analyzer:
             final_distributions[btype] = np.concatenate(list_of_arrays)
 
         return final_distributions
+
+
+def _sorted_frame_keys(h5_file):
+    """Return original integer frame keys in numerical order, excluding metadata."""
+    keys = []
+    for key in h5_file.keys():
+        try:
+            int(key)
+        except ValueError:
+            continue
+        keys.append(key)
+    return sorted(keys, key=int)
+
+
+def _orthorhombic_lengths(boxes):
+    """Validate the box convention shared by trajectory and Hi-C MIC paths."""
+    boxes = np.asarray(boxes, dtype=float)
+    if boxes.shape[-2:] != (3, 3) or not np.all(np.isfinite(boxes)):
+        raise ValueError("Box vectors must be finite 3x3 matrices")
+    lengths = np.diagonal(boxes, axis1=-2, axis2=-1)
+    diagonal = np.zeros_like(boxes)
+    diagonal[..., np.arange(3), np.arange(3)] = lengths
+    if np.any(lengths <= 0) or not np.allclose(boxes, diagonal, rtol=0, atol=1e-12):
+        raise ValueError("MIC requires orthorhombic boxes with positive lengths")
+    return lengths
 
 
 class TrajectoryLoader:
@@ -1602,16 +1739,13 @@ class TrajectoryLoader:
         np.ndarray
             Array of positions with shape (T, N, 3) for T frames.
         """
+        if not isinstance(d, (int, np.integer)) or d < 1:
+            raise ValueError("d must be a positive integer frame-ID divisor")
         pos: list[np.ndarray] = []
         with h5py.File(str(traj_file), "r") as f:
-            for key in sorted(f.keys()):
-                try:
-                    frame_id = int(key)
-                    if frame_id % d == 0:
-                        pos.append(np.array(f[key]))
-                except ValueError:
-                    # Ignore keys that are not integer frame IDs
-                    pass
+            for key in _sorted_frame_keys(f):
+                if int(key) % d == 0:
+                    pos.append(np.array(f[key]))
 
         return np.array(pos)
 
@@ -1631,6 +1765,7 @@ class Trajectory:
         self.filename = filename
         self.n_beads = 0  # renamed from Nbeads
         self.n_frames = 0  # renamed from Nframes
+        self.frame_keys = []
         self.chrom_seq = []
         self.unique_chrom_seq = set()
         self.dict_chrom_seq = {}
@@ -1649,14 +1784,16 @@ class Trajectory:
         if not os.path.exists(filename):
             raise FileNotFoundError(f"File not found: {filename}")
 
+        self.close()
         self.cndb = h5py.File(filename, "r")
 
         # Sort frame keys
-        frame_keys = sorted([k for k in self.cndb.keys() if k.isdigit()], key=int)
+        self.frame_keys = _sorted_frame_keys(self.cndb)
+        frame_keys = self.frame_keys
         self.n_frames = len(frame_keys)
 
         if self.n_frames == 0:
-            print("Warning: No frames found in file.")
+            logger.warning("No frames found in file.")
             return self
 
         # --- 1. Load Bead Number ---
@@ -1670,7 +1807,7 @@ class Trajectory:
                 t.decode("utf-8") if isinstance(t, bytes) else t for t in raw_types
             ]
         else:
-            print("  Warning: 'types' dataset not found. Assuming uniform bead types.")
+            logger.warning("'types' dataset not found. Assuming uniform bead types.")
             self.chrom_seq = ["U"] * self.n_beads
 
         self.unique_chrom_seq = set(self.chrom_seq)
@@ -1685,7 +1822,7 @@ class Trajectory:
             try:
                 self.topology = self._load_topology_from_h5(self.cndb)
             except Exception as e:
-                print(f"  Warning: Failed to load topology data from HDF5: {e}")
+                logger.warning(f"Failed to load topology data from HDF5: {e}")
 
         # --- 4. Load Box Vectors ---
         if "box" in first_frame_data.attrs:
@@ -1698,13 +1835,13 @@ class Trajectory:
         else:
             self.box_vectors = None
 
-        print(f"Loaded {self.filename}: {self.n_frames} frames, {self.n_beads} beads.")
+        logger.info(f"Loaded {self.filename}: {self.n_frames} frames, {self.n_beads} beads.")
         if self.topology:
-            print(
+            logger.info(
                 f"Topology loaded: {self.topology.getNumAtoms()} atoms, {self.topology.getNumBonds()} bonds"
             )
         if self.box_vectors is not None:
-            print(f"Box vectors loaded. Shape: {self.box_vectors.shape}")
+            logger.info(f"Box vectors loaded. Shape: {self.box_vectors.shape}")
 
         return self
 
@@ -1722,7 +1859,7 @@ class Trajectory:
         Get the selected beads' 3D position from a **cndb** file for multiple frames.
 
         Args:
-            frames: [start, end, step] frame range.
+            frames: [start, end, step] ordinal positions in numerically sorted frames.
             bead_selection: Optional bead indices to retrieve.
             xyz_cols: Coordinate columns to retrieve.
             frame_batch_size: Optional number of frames to materialize per read
@@ -1746,19 +1883,11 @@ class Trajectory:
         else:
             selection = np.array(bead_selection)
 
-        start, end, step = frames
-        if end is None:
-            end = self.n_frames
-
-        # Range check
-        start = max(0, start)
-        end = min(end, self.n_frames)
-
-        frame_indices = [i for i in range(start, end, step) if str(i) in self.cndb]
+        frame_indices = self._frame_positions(frames)
         if not frame_indices:
-            return np.array([], dtype=dtype)
+            return np.empty((0, len(selection), len(xyz_cols)), dtype=dtype)
 
-        first_frame = np.array(self.cndb[str(frame_indices[0])])
+        first_frame = np.array(self.cndb[self.frame_keys[frame_indices[0]]])
         first_selected = np.take(
             np.take(first_frame, selection, axis=0), xyz_cols, axis=1
         )
@@ -1775,48 +1904,38 @@ class Trajectory:
         elif frame_batch_size is not None or dtype is not None:
             output = np.empty(out_shape, dtype=out_dtype)
         else:
-            frame_list = []
-            for i in frame_indices:
-                try:
-                    frame_data = np.array(self.cndb[str(i)])
-                    selected_data = np.take(
-                        np.take(frame_data, selection, axis=0), xyz_cols, axis=1
-                    )
-                    frame_list.append(selected_data)
-                except KeyError:
-                    print(f"Warning: Frame {i} doesn't exist, skipping.")
-                except Exception as e:
-                    print(f"Error extracting data from frame {i}: {e}")
-            return np.array(frame_list)
+            return np.array([
+                np.take(np.take(self.cndb[self.frame_keys[i]][...], selection, axis=0), xyz_cols, axis=1)
+                for i in frame_indices
+            ])
 
         batch_size = frame_batch_size or len(frame_indices)
         for batch_start in range(0, len(frame_indices), batch_size):
-            batch_indices = frame_indices[batch_start : batch_start + batch_size]
-            batch_data = np.empty((len(batch_indices),) + first_selected.shape, dtype=out_dtype)
+            batch_indices = frame_indices[batch_start:batch_start + batch_size]
             for j, i in enumerate(batch_indices):
-                try:
-                    key = str(i)
-                    frame_data = np.array(self.cndb[key])
-                    selected_data = np.take(
-                        np.take(frame_data, selection, axis=0), xyz_cols, axis=1
-                    )
-                    if dtype is not None:
-                        selected_data = selected_data.astype(dtype, copy=False)
-                    batch_data[j] = selected_data
-                except KeyError:
-                    print(f"Warning: Frame {i} doesn't exist, skipping.")
-                except Exception as e:
-                    print(f"Error extracting data from frame {i}: {e}")
-            output[batch_start : batch_start + len(batch_indices)] = batch_data
+                frame_data = self.cndb[self.frame_keys[i]][...]
+                output[batch_start + j] = np.take(
+                    np.take(frame_data, selection, axis=0), xyz_cols, axis=1
+                )
 
         if isinstance(output, np.memmap):
             output.flush()
         return output
 
+    def _frame_positions(self, frames):
+        """Select ordinal frame positions, independently of stored frame IDs."""
+        start, end, step = frames
+        if not isinstance(step, (int, np.integer)) or step < 1:
+            raise ValueError("Frame stride must be a positive integer")
+        start = max(0, start)
+        end = self.n_frames if end is None else min(end, self.n_frames)
+        return range(start, end, step)
+
     def close(self):
         """Close the HDF5 file handle."""
         if hasattr(self, "cndb") and self.cndb:
             self.cndb.close()
+        self.cndb = None
 
     def __del__(self):
         self.close()
@@ -1917,7 +2036,7 @@ class Trajectory:
         all_positions = np.asarray(self.xyz(frames=[0, None, 1], bead_selection=None))
 
         if custom_types is not None:
-            print("Notice: Using custom-defined bead types for Rg calculation.")
+            logger.info("Notice: Using custom-defined bead types for Rg calculation.")
             bead_types = np.asarray(custom_types)
         else:
             bead_types = np.asarray(self.chrom_seq)
@@ -2089,7 +2208,7 @@ class Trajectory:
         box_to_use = source_box if use_pbc else None
 
         if custom_types is not None:
-            print("Notice: Using custom-defined bead types for Lp calculation.")
+            logger.info("Notice: Using custom-defined bead types for Lp calculation.")
             bead_types = np.asarray(custom_types)
         else:
             bead_types = np.asarray(self.chrom_seq)
@@ -2363,39 +2482,12 @@ class Trajectory:
 
         # 2. Get and process Box Vectors
         if self.box_vectors is None:
-            # If no box information is found, cannot wrap. Return raw coordinates or raise error.
-            # Here we choose to print a warning and return original coordinates.
-            print("Warning: No box vectors found. Returning unwrapped coordinates.")
+            logger.warning("No box vectors found. Returning unwrapped coordinates.")
             return coords_unwrapped
 
-        # Parse frames parameters to perform the same slicing on box_vectors
-        start, end, step = frames
-        if end is None:
-            end = self.n_frames
-
-        # Range check - maintain consistency with xyz function logic
-        start = max(0, start)
-        end = min(end, self.n_frames)
-
-        # Slice box data (T_subset, 3, 3)
-        # Note: Assumes box_vectors is a numpy array of shape (Total_Frames, 3, 3)
-        subset_boxes = self.box_vectors[start:end:step]
-
-        # 3. Perform Wrapping operation
-        # Extract box diagonal lengths (Lx, Ly, Lz)
-        # Shape transformation: (T, 3, 3) -> (T, 3)
-        box_diag = np.diagonal(subset_boxes, axis1=1, axis2=2)
-
-        # To utilize Broadcasting, reshape box_diag to (T, 1, 3)
-        # coords_unwrapped: (T, N, 3)
-        # box_diag_reshaped: (T, 1, 3)
-        box_diag_reshaped = box_diag[:, np.newaxis, :]
-
-        # Perform wrap using modulo operator
-        # math: coords_wrapped = coords % box
-        coords_wrapped = coords_unwrapped % box_diag_reshaped
-
-        return coords_wrapped
+        subset_boxes = self.box_vectors[list(self._frame_positions(frames))]
+        box_lengths = _orthorhombic_lengths(subset_boxes)[:, np.asarray(xyz_cols)]
+        return coords_unwrapped % box_lengths[:, np.newaxis, :]
 
     def check_if_wrapped(self):
         """
@@ -2409,17 +2501,17 @@ class Trajectory:
         diffs = coords[1:] - coords[:-1]
         dists = np.linalg.norm(diffs, axis=1)
 
-        print(f"Max bond distance: {np.max(dists):.4f}")
-        print(f"Mean bond distance: {np.mean(dists):.4f}")
+        logger.info(f"Max bond distance: {np.max(dists):.4f}")
+        logger.info(f"Mean bond distance: {np.mean(dists):.4f}")
 
         # Assume normal bond length is around 1.0. Large values indicate the trajectory is wrapped.
         if np.max(dists) > 10.0:  # Threshold set to, e.g., 10 times the bond length
-            print(
-                "Warning: Extremely large bond distance detected! Data appears to be Wrapped."
+            logger.warning(
+                "Extremely large bond distance detected! Data appears to be Wrapped."
             )
-            print("Direct Rg calculation will be incorrect! Must Unwrap first.")
+            logger.warning("Direct Rg calculation will be incorrect! Must Unwrap first.")
         else:
-            print(
+            logger.info(
                 "Max bond distance is normal. Data appears to be Unwrapped (continuous) or the system has not crossed boundaries."
             )
 
@@ -2434,157 +2526,72 @@ class Trajectory:
         wrapped: bool = False,
         device: str = 'gpu'  
     ) -> Dict[str, np.ndarray]:
-        """
-        Unified dispatcher for calculating spatial distances by separation and type.
-        Routes the computation to either CPU or GPU backend.
-        """
-        
-        # --- 1. Data Loading & Wrapped Routing ---
-        # IO part
-        if wrapped:
-            xyz = self.xyz_wrapped(frames=[start_frame, end_frame, sampling_step])
-        else:
-            xyz = self.xyz(frames=[start_frame, end_frame, sampling_step])
+        """Distances at contour separation s, within each topology chain.
 
-        # --- 2. Basic Parsing & Validation ---
-        if bead_types is None:
-            bead_types = np.asarray(self.chrom_seq)
-
+        Frame bounds select ordinal positions once. With wrapped=True, distances
+        use the minimum image of the selected orthorhombic boxes. Without native
+        topology the particle array is treated as one linear chain; chain order
+        is also used for rings (no shortest-ring-distance convention is implied).
+        """
+        frames = [start_frame, end_frame, sampling_step]
+        if device.lower() not in {"cpu", "gpu"}:
+            raise ValueError("device must be 'cpu' or 'gpu'")
+        if not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        xyz = self.xyz(frames=frames)
+        bead_types = np.asarray(self.chrom_seq if bead_types is None else bead_types)
         if bead_types.dtype.kind == 'S':
             bead_types = np.char.decode(bead_types, 'utf-8')
-
-        n_frames_total, n_particles, _ = xyz.shape
-
-        if bead_types.shape[0] != n_particles:
-            raise ValueError("The length of bead_types must match the number of particles in xyz.")
-        
-        if not (0 < s < n_particles):
-            raise ValueError(f"Separation s must be between 1 and {n_particles-1}.")
-
-        # Handle frame slicing logic
-        if end_frame is None:
-            end_frame = n_frames_total
-            
-        frames_to_process = list(range(start_frame, end_frame, sampling_step))
-        if len(frames_to_process) == 0:
+        if bead_types.shape != (self.n_beads,):
+            raise ValueError("bead_types must have one label per particle")
+        if not isinstance(s, (int, np.integer)) or not 0 < s < self.n_beads:
+            raise ValueError(f"Separation s must be between 1 and {self.n_beads-1}")
+        boxes = None
+        if wrapped:
+            if self.box_vectors is None:
+                raise ValueError("wrapped distances require periodic box vectors")
+            boxes = _orthorhombic_lengths(self.box_vectors[list(self._frame_positions(frames))])
+        if not len(xyz):
             return {}
-            
-        # slice the xyz data
-        xyz_sliced = xyz[frames_to_process]
-
-        # --- 3. Device Dispatch ---
-        if device.lower() == 'gpu':
-            if CUPY_AVAILABLE:
-                print(f"Routing to GPU backend... (Wrapped: {wrapped})")
-                return self._calc_distances_gpu_worker(xyz_sliced, bead_types, s, batch_size)
-            else:
-                print("CuPy not available. Calculation will be performed on CPU.")
-                print(f"Routing to CPU backend... (Wrapped: {wrapped})")
-                return self._calc_distances_cpu_worker(xyz_sliced, bead_types, s, batch_size)
-        elif device.lower() == 'cpu':
-            print(f"Routing to CPU backend... (Wrapped: {wrapped})")
-            return self._calc_distances_cpu_worker(xyz_sliced, bead_types, s, batch_size)
+        if self.topology is None:
+            chains = [np.arange(self.n_beads)]
         else:
-            raise ValueError(f"Unsupported device: '{device}'. Please choose 'cpu' or 'gpu'.")
+            if self.topology.getNumAtoms() != self.n_beads:
+                raise ValueError("Topology particle count must match trajectory")
+            chains = [np.array([a.index for a in c.atoms()]) for c in self.topology.chains()]
+        pairs = [(chain[:-s], chain[s:]) for chain in chains if len(chain) > s]
+        if not pairs:
+            return {}
+        i = np.concatenate([pair[0] for pair in pairs])
+        j = np.concatenate([pair[1] for pair in pairs])
+        xp = cp if device.lower() == 'gpu' and CUPY_AVAILABLE else np
+        return self._calc_distances_worker(xyz, bead_types, i, j, batch_size, boxes, xp)
 
-    # ==========================================
-    # Private workers
-    # ==========================================
-
-    def _calc_distances_cpu_worker(
-        self, xyz_sliced: np.ndarray, bead_types: np.ndarray, s: int, batch_size: int
-    ) -> Dict[str, np.ndarray]:
-        """
-        Private worker for CPU batch processing. 
-        Assumes xyz_sliced and bead_types are pre-validated.
-        """
+    @staticmethod
+    def _calc_distances_worker(xyz, bead_types, i, j, batch_size, boxes, xp):
+        # One pair/MIC implementation for both NumPy and CuPy backends.
         unique_types = np.unique(bead_types)
-        type_to_int_map = {t: i for i, t in enumerate(unique_types)}
-        int_to_type_map = {i: t for i, t in enumerate(unique_types)} 
-
-        integer_bead_types = np.array([type_to_int_map[t] for t in bead_types], dtype=np.int32)
-        unique_type_ints = np.arange(len(unique_types))
-        type_int_pairs = list(combinations_with_replacement(unique_type_ints, 2))
-        
-        types_i = integer_bead_types[:-s]
-        types_j = integer_bead_types[s:]
-        
-        valid_pair_masks = {}
-        for type_int1, type_int2 in type_int_pairs:
-            mask = (types_i == type_int1) & (types_j == type_int2) if type_int1 == type_int2 else \
-                   ((types_i == type_int1) & (types_j == type_int2)) | ((types_i == type_int2) & (types_j == type_int1))
+        masks = {}
+        for t1, t2 in combinations_with_replacement(unique_types, 2):
+            mask = ((bead_types[i] == t1) & (bead_types[j] == t2))
+            if t1 != t2:
+                mask |= ((bead_types[i] == t2) & (bead_types[j] == t1))
             if np.any(mask):
-                valid_pair_masks[(type_int1, type_int2)] = mask
-
-        frame_count = xyz_sliced.shape[0]
-        batched_results = defaultdict(list)
-
-        for batch_start in range(0, frame_count, batch_size):
-            batch_end = min(batch_start + batch_size, frame_count)
-            batch_coords = xyz_sliced[batch_start:batch_end]
-            
-            diffs = batch_coords[:, s:, :] - batch_coords[:, :-s, :]
-            off_diagonal_distances = np.linalg.norm(diffs, axis=2)
-            
-            for (type_int1, type_int2), mask in valid_pair_masks.items():
-                selected_distances = off_diagonal_distances[:, mask].ravel()
-                batched_results[(type_int1, type_int2)].append(selected_distances)
-
-        final_results = {}
-        for (type_int1, type_int2), list_of_arrays in batched_results.items():
-            final_results[f"{int_to_type_map[type_int1]}-{int_to_type_map[type_int2]}"] = np.concatenate(list_of_arrays)
-            
-        return final_results
-
-    def _calc_distances_gpu_worker(
-        self, xyz_sliced: np.ndarray, bead_types: np.ndarray, s: int, batch_size: int
-    ) -> Dict[str, np.ndarray]:
-        """
-        Private worker for GPU batch processing. 
-        Assumes xyz_sliced and bead_types are pre-validated.
-        """
-        unique_types = np.unique(bead_types)
-        type_to_int_map = {t: i for i, t in enumerate(unique_types)}
-        int_to_type_map = {i: t for i, t in enumerate(unique_types)} 
-
-        integer_bead_types = np.array([type_to_int_map[t] for t in bead_types], dtype=np.int32)
-        unique_type_ints = np.arange(len(unique_types))
-        type_int_pairs = list(combinations_with_replacement(unique_type_ints, 2))
-        
-        bead_types_cp = cp.array(integer_bead_types)
-        types_i = bead_types_cp[:-s]
-        types_j = bead_types_cp[s:]
-        
-        valid_pair_masks_cp = {}
-        for type_int1, type_int2 in type_int_pairs:
-            mask = (types_i == type_int1) & (types_j == type_int2) if type_int1 == type_int2 else \
-                   ((types_i == type_int1) & (types_j == type_int2)) | ((types_i == type_int2) & (types_j == type_int1))
-            if cp.any(mask):
-                valid_pair_masks_cp[(type_int1, type_int2)] = mask
-
-        frame_count = xyz_sliced.shape[0]
-        batched_results_cpu = defaultdict(list)
-
-        for batch_start in range(0, frame_count, batch_size):
-            batch_end = min(batch_start + batch_size, frame_count)
-            batch_coords_cp = cp.array(xyz_sliced[batch_start:batch_end])
-            
-            diffs_cp = batch_coords_cp[:, s:, :] - batch_coords_cp[:, :-s, :]
-            off_diagonal_distances_cp = cp.linalg.norm(diffs_cp, axis=2)
-            
-            for (type_int1, type_int2), mask_cp in valid_pair_masks_cp.items():
-                selected_distances_cp = off_diagonal_distances_cp[:, mask_cp].ravel()
-                batched_results_cpu[(type_int1, type_int2)].append(cp.asnumpy(selected_distances_cp))
-            
-            del batch_coords_cp, diffs_cp, off_diagonal_distances_cp, selected_distances_cp
-            cp.get_default_memory_pool().free_all_blocks()
-
-        final_results = {}
-        for (type_int1, type_int2), list_of_arrays in batched_results_cpu.items():
-            final_results[f"{int_to_type_map[type_int1]}-{int_to_type_map[type_int2]}"] = np.concatenate(list_of_arrays)
-            
-        return final_results
-
+                masks[f"{t1}-{t2}"] = xp.asarray(mask)
+        results = {key: [] for key in masks}
+        idx_i, idx_j = xp.asarray(i), xp.asarray(j)
+        for start in range(0, len(xyz), batch_size):
+            stop = min(start + batch_size, len(xyz))
+            coords = xp.asarray(xyz[start:stop])
+            dr = coords[:, idx_j, :] - coords[:, idx_i, :]
+            if boxes is not None:
+                lengths = xp.asarray(boxes[start:stop])[:, None, :]
+                dr -= lengths * xp.rint(dr / lengths)
+            distances = xp.linalg.norm(dr, axis=2)
+            for key, mask in masks.items():
+                values = distances[:, mask].ravel()
+                results[key].append(values if xp is np else cp.asnumpy(values))
+        return {key: np.concatenate(values) for key, values in results.items()}
 
 
 # --- External Wrappers (For Backward Compatibility / Functional Style) ---
@@ -2646,17 +2653,15 @@ def save_pdb(chrom_dyn_obj, **kwargs):
     state = chrom_dyn_obj.simulation.context.getState(
         getPositions=True, enforcePeriodicBox=PBC
     )
-    positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+    positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
     topology = chrom_dyn_obj.topology  # OpenMM Topology
 
     with open(filename, "w") as pdb_file:
         pdb_file.write(f"TITLE     {chrom_dyn_obj.name}\n")
         if PBC:
             # get box vectors
-            box = chrom_dyn_obj.simulation.context.getState().getPeriodicBoxVectors()
-            a = box[0].x * 10.0  # nm to Angstrom for PDB
-            b = box[1].y * 10.0
-            c = box[2].z * 10.0
+            box = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
+            a, b, c = _orthorhombic_lengths(box)
             # PDB CRYST1 format: lenA lenB lenC alpha beta gamma SpaceGroup
             pdb_file.write(
                 f"CRYST1{a:9.3f}{b:9.3f}{c:9.3f}  90.00  90.00  90.00 P 1           1\n"

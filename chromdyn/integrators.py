@@ -13,6 +13,20 @@ from openmm import (
 from .utilities import LogManager
 
 
+def _validate_scalar(name, value, allow_zero=False):
+    if not np.isfinite(value) or (value < 0 if allow_zero else value <= 0):
+        bound = "nonnegative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be finite and {bound}")
+
+
+def _validate_active_parameter(name, values):
+    if name not in {"t_corr", "F_act"}:
+        return
+    values = np.asarray(values, dtype=float)
+    if not np.all(np.isfinite(values)) or (name == "t_corr" and np.any(values <= 0)):
+        raise ValueError(f"{name} must be finite" + (" and positive" if name == "t_corr" else ""))
+
+
 # -------------------------------------------------------------------
 # Integrator Manager: Creates integrators for Brownian or Langevin dynamics
 # -------------------------------------------------------------------
@@ -38,6 +52,11 @@ class IntegratorManager:
             integrator (str): Type of integrator ('brownian', 'langevin', 'active').
             logger (Logger, optional): Logger instance. If None, initializes a default logger.
             **kwargs: Optional parameters (temperature, friction, timestep, tcorr, Fact).
+
+        Friction convention: builtin Brownian/Langevin and active Langevin use
+        gamma (inverse time), corresponding to physical drag m*gamma. Active
+        Brownian uses physical drag g directly: dx=(f+p)*dt/g+sqrt(2*kbT*dt/g)*xi.
+        Mass does not enter the active-Brownian position update.
         """
         self.logger = logger or LogManager().get_logger(__name__)
         self.logger.info("Creating integrator ...")
@@ -55,6 +74,7 @@ class IntegratorManager:
             self.timestep = kwargs.get("timestep", self.DEFAULT_PARAMS["timestep"])
             self.advance_time = kwargs.get("advance_time", False)
             self.precompute_coefficients = kwargs.get("precompute_coefficients", True)
+            self.store_thermal_kick = kwargs.get("store_thermal_kick", False)
             self.store_unconstrained_positions = kwargs.get(
                 "store_unconstrained_positions", False
             )
@@ -99,7 +119,7 @@ class IntegratorManager:
                 )
                 self.logger.info("Initialized active parameters: F=0.0 and t_corr=1.0.")
                 self.logger.info(
-                    "These parameters are per dof variables and can be set any time using .set_active_params(F_seq, tau_seq)"
+                    "These parameters are per dof variables and can be set any time using .set_activity(F_seq, tau_seq)"
                 )
                 # self.logger.info("integrator.setPerDofVariableByName('t_corr', [Vec3(t,t,t) for t in tau_list]).")
                 self.is_active = True
@@ -113,7 +133,7 @@ class IntegratorManager:
                 )
                 self.logger.info("Initialized active parameters: F=0.0 and t_corr=1.0.")
                 self.logger.info(
-                    "These parameters are per dof variables and can be set any time using .set_active_params(F_seq, tau_seq)"
+                    "These parameters are per dof variables and can be set any time using .set_activity(F_seq, tau_seq)"
                 )
                 # self.logger.info("integrator.setPerDofVariableByName('t_corr', [Vec3(t,t,t) for t in tau_list]).")
                 self.is_active = True
@@ -124,6 +144,7 @@ class IntegratorManager:
                     advance_time=self.advance_time,
                     store_unconstrained_positions=self.store_unconstrained_positions,
                     precompute_coefficients=self.precompute_coefficients,
+                    store_thermal_kick=self.store_thermal_kick,
                 )
 
         except Exception as e:
@@ -140,12 +161,18 @@ class ActiveBrownianIntegrator(CustomIntegrator):
     R"""
     Overdamped Brownian dynamics with a separate per-DOF active OU force ``p``.
 
+    ``collision_rate`` is physical drag g (mass/time in OpenMM numerical units),
+    rather than the inverse-time gamma of OpenMM BrownianIntegrator. The latter
+    uses g=m*gamma. Particle mass does not affect this integrator's displacement.
+
     ``precompute_coefficients=True`` caches the OU and Brownian coefficients.
     Explicit activity, step-size, ``g``, or ``kbT`` setters refresh the cache;
     ``refresh_coefficients()`` is also available after low-level state changes.
     Set ``store_unconstrained_positions=True`` to save pre-constraint positions
     in ``x1``. This optional snapshot is off by default to avoid an extra GPU
     update kernel; position constraints are applied in either mode.
+    With store_thermal_kick, thermal_kick holds the exact stochastic displacement
+    used in the most recent position update, before constraints.
     """
 
     def __init__(
@@ -158,6 +185,7 @@ class ActiveBrownianIntegrator(CustomIntegrator):
         advance_time=False,
         store_unconstrained_positions=False,
         precompute_coefficients=True,
+        store_thermal_kick=False,
     ):
         super().__init__(timestep)
         self._validate_scalar("timestep", self.getStepSize().value_in_unit(unit.picosecond))
@@ -193,17 +221,20 @@ class ActiveBrownianIntegrator(CustomIntegrator):
         self.addUpdateContextState()
         if self.precompute_coefficients:
             self.addComputePerDof("p", "ou_decay * p + ou_noise * gaussian")
-            self.addComputePerDof(
-                "x", "x + bd_drift * (f + p) + bd_noise * gaussian"
-            )
+            drift = "bd_drift * (f + p)"
+            thermal = "bd_noise * gaussian"
         else:
             self.addComputePerDof(
                 "p",
                 "exp(-dt / t_corr) * p + sqrt(1 - exp(-2 * dt / t_corr)) * F_act * gaussian",
             )
-            self.addComputePerDof(
-                "x", "x + dt * (f + p) / g + sqrt(2 * kbT * dt / g) * gaussian"
-            )
+            drift = "dt * (f + p) / g"
+            thermal = "sqrt(2 * kbT * dt / g) * gaussian"
+        if store_thermal_kick:
+            self.addPerDofVariable("thermal_kick", 0)
+            self.addComputePerDof("thermal_kick", thermal)
+            thermal = "thermal_kick"
+        self.addComputePerDof("x", f"x + {drift} + {thermal}")
         if self.store_unconstrained_positions:
             self.addComputePerDof("x1", "x")
         self.addConstrainPositions()
@@ -261,17 +292,11 @@ class ActiveBrownianIntegrator(CustomIntegrator):
 
     @staticmethod
     def _validate_scalar(name, value, allow_zero=False):
-        if not np.isfinite(value) or (value < 0 if allow_zero else value <= 0):
-            bound = "nonnegative" if allow_zero else "positive"
-            raise ValueError(f"Brownian {name} must be finite and {bound}")
+        _validate_scalar(f"Brownian {name}", value, allow_zero)
 
     @staticmethod
     def _validate_per_dof_parameter(name, values):
-        if name not in {"t_corr", "F_act"}:
-            return
-        values = np.asarray(values, dtype=float)
-        if not np.all(np.isfinite(values)) or (name == "t_corr" and np.any(values <= 0)):
-            raise ValueError(f"{name} must be finite" + (" and positive" if name == "t_corr" else ""))
+        _validate_active_parameter(name, values)
 
     def _validate_global_parameter(self, name, value):
         if name == "g":
@@ -316,6 +341,14 @@ class ActiveBrownianIntegrator(CustomIntegrator):
 
 class ActiveLangevinIntegrator(CustomIntegrator):
     def __init__(self, temperature, gamma, dt, corr_time=1.0, advance_time=False):
+        temperature = temperature.value_in_unit(unit.kelvin) if unit.is_quantity(temperature) else temperature
+        gamma = gamma.value_in_unit(unit.picosecond**-1) if unit.is_quantity(gamma) else gamma
+        dt = dt.value_in_unit(unit.picosecond) if unit.is_quantity(dt) else dt
+        corr_time = corr_time.value_in_unit(unit.picosecond) if unit.is_quantity(corr_time) else corr_time
+        _validate_scalar("temperature", temperature, allow_zero=True)
+        _validate_scalar("gamma", gamma, allow_zero=True)
+        _validate_scalar("timestep", dt)
+        _validate_scalar("correlation time", corr_time)
         super().__init__(dt)
 
         # WARNING: advance_time=True assumes the Context has a global parameter 't'.
@@ -339,8 +372,11 @@ class ActiveLangevinIntegrator(CustomIntegrator):
         self.addPerDofVariable("F_act", 0)  # set from Python per particle (Vec3)
 
         # Precompute c each step
+        # Keep the existing global layout, but derive halfdt from the live dt.
+        self.addComputeGlobal("halfdt", "0.5*dt")
         self.addComputeGlobal("c", "exp(-gamma*dt)")
-        self.addComputeGlobal("one_minus_c2", "1 - c*c")
+        # Equivalent to -expm1(-2*gamma*dt); expm1 is not a Lepton function.
+        self.addComputeGlobal("one_minus_c2", "(1+c*c)*tanh(gamma*dt)")
 
         self.addUpdateContextState()
 
@@ -348,7 +384,7 @@ class ActiveLangevinIntegrator(CustomIntegrator):
         # p <- e^{-dt/τ} p + sqrt(1 - e^{-2dt/τ}) * σ_p * ξ
         self.addComputePerDof(
             "p",
-            "exp(-halfdt/t_corr)*p + sqrt(1 - exp(-2*halfdt/t_corr)) * F_act * gaussian",
+            "exp(-halfdt/t_corr)*p + sqrt((1+exp(-2*halfdt/t_corr))*tanh(halfdt/t_corr)) * F_act * gaussian",
         )
 
         # ---- First half kick with conservative + active ----
@@ -375,12 +411,37 @@ class ActiveLangevinIntegrator(CustomIntegrator):
 
         self.addComputePerDof(
             "p",
-            "exp(-halfdt/t_corr)*p + sqrt(1 - exp(-2*halfdt/t_corr)) * F_act * gaussian",
+            "exp(-halfdt/t_corr)*p + sqrt((1+exp(-2*halfdt/t_corr))*tanh(halfdt/t_corr)) * F_act * gaussian",
         )
 
         # Advance global time at the end of the step
         if self.advance_time_flag:
             self.addComputeGlobal("t", "t + dt")
+
+    def setStepSize(self, size):
+        value = size.value_in_unit(unit.picosecond) if unit.is_quantity(size) else size
+        _validate_scalar("timestep", value)
+        super().setStepSize(size)
+
+    def setPerDofVariable(self, index, values):
+        _validate_active_parameter(self.getPerDofVariableName(index), values)
+        super().setPerDofVariable(index, values)
+
+    def setPerDofVariableByName(self, name, values):
+        _validate_active_parameter(name, values)
+        super().setPerDofVariableByName(name, values)
+
+    def _validate_global_parameter(self, name, value):
+        if name in {"gamma", "kbT"}:
+            _validate_scalar(name, value, allow_zero=True)
+
+    def setGlobalVariable(self, index, value):
+        self._validate_global_parameter(self.getGlobalVariableName(index), value)
+        super().setGlobalVariable(index, value)
+
+    def setGlobalVariableByName(self, name, value):
+        self._validate_global_parameter(name, value)
+        super().setGlobalVariableByName(name, value)
 
 
 class ActiveBrownianIntegratorLegacy(CustomIntegrator):

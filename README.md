@@ -67,6 +67,11 @@ python -m pytest -v
 
 The small numerical tests use OpenMM's CPU Reference platform. CUDA-specific comparisons skip when CUDA is unavailable. CI checks both `main` and `update_v_0.2`.
 
+See [Numerical conventions and corrected behavior](NUMERICAL_NOTES.md) for friction
+parameters, frame selection, periodic distances, PDB units, Dozat Nadam, and report
+finalization. Additional local GPU regressions can be enabled with
+`CHROMDYN_TEST_GPU=1` when OpenMM GPU platforms and CuPy are available.
+
 ## Quick Example
 
 ```python
@@ -90,6 +95,7 @@ sim.simulation_setup(
 )
 
 sim.run(1000)
+sim.close()  # Finalize owned report and log files.
 ```
 
 ## Tutorials

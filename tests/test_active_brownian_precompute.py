@@ -187,3 +187,21 @@ def test_cuda_cached_and_uncached_trajectories_agree(constrained):
         del ctx, it
     for actual, expected in zip(results[1], results[0]):
         np.testing.assert_allclose(actual, expected, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("precompute", [False, True])
+def test_recorded_thermal_kick_is_the_displacement_used_for_that_step(precompute):
+    dt, gamma = 0.001, 2.0
+    integ = ActiveBrownianIntegrator(temperature=24, timestep=dt, collision_rate=gamma,
+                                     precompute_coefficients=precompute, store_thermal_kick=True)
+    integ.setRandomNumberSeed(2048)
+    ctx = _context(integ, 4)
+    integ.set_activity([6., 0., 6., 0.], [1.]*4)
+    for _ in range(3):
+        before = _positions(ctx)
+        integ.step(1)
+        ou = np.asarray(integ.getPerDofVariableByName("p"))
+        kick = np.asarray(integ.getPerDofVariableByName("thermal_kick"))
+        assert np.any(kick)
+        np.testing.assert_allclose(_positions(ctx)-before, dt/gamma*(np.array([2., -1., 0.])+ou)+kick,
+                                   atol=1e-12, rtol=1e-12)

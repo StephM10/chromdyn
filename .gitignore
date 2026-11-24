@@ -9,7 +9,6 @@ venv/
 .ipynb_checkpoints/
 .DS_Store
 *.log
-.ipynb_checkpoints/
 *.csv
 *.tsv
 *.h5
@@ -22,4 +21,6 @@ dist/
 build/
 .ruff_cache/
 .pytest_cache/
+.pytest_tmp*/
+notebooks/output/
 chromdyn/_version.py

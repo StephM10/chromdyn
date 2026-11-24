@@ -11,10 +11,21 @@ import h5py
 from pathlib import Path
 from .hic_utils import HiCManager
 
-hicman = HiCManager()
-
-
 class EnergyLandscapeOptimizer:
+    VALID_METHODS = frozenset({"adam", "nadam", "rmsprop", "adagrad", "gd", "sgd"})
+
+    @classmethod
+    def _validate_method(cls, method: str) -> str:
+        if not isinstance(method, str):
+            raise ValueError(
+                f"Unsupported optimization method '{method}'. Choose from {sorted(cls.VALID_METHODS)}."
+            )
+        normalized = method.lower()
+        if normalized not in cls.VALID_METHODS:
+            raise ValueError(
+                f"Unsupported optimization method '{method}'. Choose from {sorted(cls.VALID_METHODS)}."
+            )
+        return normalized
 
     def __init__(
         self,
@@ -41,14 +52,16 @@ class EnergyLandscapeOptimizer:
                 - "gd": Vanilla (batch) gradient descent using the full gradient.
                 - "sgd": Stochastic gradient descent with mini-batch sampling of matrix entries.
             eta: Initial learning rate.
-            beta1, beta2, epsilon: Adam-related hyperparameters.
+            beta1, beta2, epsilon: Adam/Nadam hyperparameters. RMSProp uses
+                beta1 as its squared-gradient decay rho (existing convention).
             it: Initial iteration counter.
             error_pca_weight: Weight for regularizing error using PCA.
             scheduler: Type of learning rate scheduler ("none", "step", "cosine", or "exponential").
             scheduler_decay: Decay factor (used as lambda for exponential decay, or decay factor for step decay).
             scheduler_step: Number of iterations per step decay.
             scheduler_eta_min: Minimum learning rate for the cosine scheduler.
-            scheduler_T_max: Total iterations for cosine annealing.
+            scheduler_T_max: Iteration of the first cosine minimum. The cosine
+                continues past this point; it is not clamped to eta_min.
             sgd_batch_fraction: Fraction of matrix entries to sample per SGD step (0, 1]. Default 0.5.
         """
         self.beta1 = beta1
@@ -57,7 +70,7 @@ class EnergyLandscapeOptimizer:
         self.eta0 = eta  # Store the initial learning rate
         self.eta = eta  # Current learning rate
         self.t = int(it)
-        self.method = method.lower()
+        self.method = self._validate_method(method)
         self.opt_params = None
         self.phi_exp = None  # Experimental Hi-C data
         self.force_field = None
@@ -114,7 +127,7 @@ class EnergyLandscapeOptimizer:
             raise ValueError("Experimental HiC input is NOT symmetric.")
 
         if filter != "None":
-            hic_mat = hicman.filter_matrix(hic_mat, method=filter)
+            hic_mat = HiCManager().filter_matrix(hic_mat, method=filter)
         # Apply cutoffs to remove noise
         hic_mat = np.clip(hic_mat, a_min=cutoff_low, a_max=cutoff_high)
 
@@ -182,8 +195,16 @@ class EnergyLandscapeOptimizer:
             v_dw_corr = self.opt_params["v_dw"] / (1 - self.beta2**self.t)
 
             if self.method == "nadam":
+                # Dozat (2015), "Incorporating Nesterov Momentum into Adam",
+                # Algorithm 8: https://cs229.stanford.edu/proj2015/054_report.pdf
+                # Constant momentum mu_t=beta1: the lookahead moment uses
+                # 1-beta1^(t+1), while the current gradient uses 1-beta1^t.
+                # No momentum warm-up schedule is applied.
                 lookahead_gradient = (1 - self.beta1) * grad / (1 - self.beta1**self.t)
-                m_dw_corr += lookahead_gradient
+                m_dw_corr = (
+                    self.beta1 * self.opt_params["m_dw"] / (1 - self.beta1**(self.t+1))
+                    + lookahead_gradient
+                )
 
             w = lambda_t - self.eta * m_dw_corr / (np.sqrt(v_dw_corr) + self.epsilon)
 
@@ -213,6 +234,10 @@ class EnergyLandscapeOptimizer:
             # Scale by 1/fraction so the expected value equals the full gradient
             stochastic_grad = grad * rand_mask / self.sgd_batch_fraction
             w = lambda_t - self.eta * stochastic_grad
+        else:
+            raise ValueError(
+                f"Unsupported optimization method '{self.method}'. Choose from {sorted(self.VALID_METHODS)}."
+            )
 
         self.save_optimization_params()
         self.t += 1
@@ -227,14 +252,14 @@ class EnergyLandscapeOptimizer:
         return gt
 
     def set_opt_method(self, method: str) -> None:
-        self.method = method.lower()
+        self.method = self._validate_method(method)
 
     def get_updated_params(
         self, lambda_t: np.ndarray, phi_sim: np.ndarray
     ) -> np.ndarray:
         """Computes and updates the force field from the given file."""
-        phi_sim *= self.mask
-        grad = self.get_error_gradient(phi_sim)
+        masked_phi_sim = phi_sim * self.mask
+        grad = self.get_error_gradient(masked_phi_sim)
         updated_lambda = self.update_step(grad, lambda_t)
         return updated_lambda
 
