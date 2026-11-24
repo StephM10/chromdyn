@@ -16,6 +16,14 @@ Leren Wang's development extensions are maintained on [`StephM10/chromdyn:update
 
 See [Contribution history](CONTRIBUTIONS.md) for the original-main baseline, the v0.2 migration, and commit-level attribution. Features listed here are code capabilities; performance and scientific conclusions require measurements for the chosen model and parameters.
 
+## Latest update: numerical reliability and scalable analysis
+
+The [24 November 2026 update report](UPDATE_REPORT_2026-11-24.md) explains the
+corrected forces, frame selection, periodic distances, Hi-C weighting, and Nadam
+updates, plus faster writhe and batched GPU trajectory reads. It includes user
+impact, compatibility changes, 201 passing version-controlled regression cases,
+and measured performance limits. Read it before comparing results across versions.
+
 ## Overview
 
 `chromdyn` provides tools for building, simulating, and analyzing 3D chromosome structures.  
