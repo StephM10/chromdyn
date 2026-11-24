@@ -1,6 +1,67 @@
-# Update Report (2026-11-24)
+# Correctness, numerical stability, and scalable analysis update (2026-11-24)
 
-This report consolidates all correctness fixes, numerical-stability and performance optimizations, logging cleanups, and regression tests integrated into `update_v_0.2` and merged into `main`.
+This update strengthens the simulation and trajectory-analysis workflows maintained
+in the StephM10 fork of chromdyn. It corrects cases that could silently change
+physical forces, frame selection, periodic distances, contact probabilities, or
+optimization steps, and makes several expensive analyses faster or less demanding
+of GPU memory. The changes are integrated into `update_v_0.2` and `main`.
+
+The original framework is by **Sumitabha Brahmachari**; this fork's development
+and maintenance are by **Leren Wang (StephM10)**. This report describes the current
+fork update, compared with `cd209f7`, rather than an upstream release or a claim
+that all existing chromdyn features were introduced here. See
+[contribution history](CONTRIBUTIONS.md) for earlier work and attribution.
+
+## What changes for users, and why it matters
+
+The main significance is **numerical reliability**: successful execution and a
+plausible plot can conceal incorrect sampling or analysis. The update adds
+analytic and CPU/GPU regression cases for the affected paths, alongside the
+implementation fixes.
+
+| Workflow | Previous failure or limitation | Result of this update |
+| --- | --- | --- |
+| Trajectory time order and frame selection | String sorting could put frame 10 before frame 2; sparse keys could omit frames; distance analysis could apply the frame stride twice. | Numeric ordering and one position-based selection keep coordinates, boxes, and requested samples aligned. This protects time-dependent observables and subsampled distributions. |
+| Periodic geometry and polymer connectivity | Wrapping each coordinate did not give minimum-image distances; contour pairs could cross chain boundaries. | Distances use the recorded orthorhombic box and chain-local contour pairs. In a box of length 10, positions 0.1 and 9.9 give distance 0.2 rather than 9.8. |
+| Contact maps | Parallel PBC analysis could discard trailing frames and underweight the result; CPU/GPU self-contact conventions differed. | Every selected frame contributes with its actual weight, and self contacts are zero. The 21-frame/two-worker example previously used only 20 frames, reducing identical-frame results by 4.76%. |
+| Forces and dynamics | Origin/axis gradients could be invalid despite finite potential energy; deleting forces could change the wrong interaction; changing an active-Langevin step size left half-step coefficients stale. | Analytic force checks, live force-index mapping, and synchronized half-steps protect the intended equations on the tested paths. |
+| Long-trajectory analysis | GPU single-precision FFT terms could produce negative small-lag MSD; CPU/GPU geometry precision could change bin assignments. | Float64 GPU MSD intermediates and consistent spatial-correlation precision preserve the tested analytic values and bin membership. |
+| Large analyses | Scalar writhe loops were expensive, and GPU contact calculations could transfer the full trajectory despite a batch setting. | Vectorized writhe and actual HDF5-to-GPU frame batches reduce measured runtime and limit trajectory-transfer memory. The dense contact matrix still requires O(N²) memory. |
+| Repeated simulations and distribution | Output depended on the log switch; files and log routing could outlive their intended owner; package discovery included local experiment/build directories. | Independent output controls, owned-file finalization, isolated logs, and wheel-content checks make repeated runs and installation artifacts more reproducible. |
+
+**Validation:** the final version-controlled suite has **201 passing tests** with
+local GPU comparisons enabled. Both pushed branches passed GitHub CI. The final
+N=250 writhe benchmark was about **196x faster** than the scalar implementation,
+with absolute difference **3.04e-13**; this is a measured small example, not a
+universal speedup. Small MSD and spatial-correlation workloads were faster on CPU
+than GPU. Section 5 records the final measurements and the test-count scope.
+
+## Compatibility and upgrading existing workflows
+
+- **Nadam changes numerically:** it now follows Dozat's Algorithm 8 with constant
+  momentum. Continuing old moment arrays applies the corrected update rule;
+  optimization histories spanning the update should record that change.
+- **PDB export uses consistent angstrom coordinates and boxes.** CNDB coordinates
+  retain their recorded numerical length scale. Reduced simulations still need
+  their own physical calibration; no new calibration is inferred.
+- **Stability reporting changes:** active integrators use their live temperature
+  scale; overdamped runs do not reset velocities; non-finite monitored energy
+  raises an explicit error. Unknown custom integrators need a reference energy.
+- **Writhe defaults to the vectorized implementation.** `method="legacy"` remains
+  available for comparison; both reject NaN/Inf coordinates. Finite planar
+  degeneracies retain their tested zero behavior.
+- **Output finalization is explicit:** `save_reports()` closes and detaches owned
+  reports; `close()` also closes owned log handlers. Use it when a run is finished.
+- **Retained conventions:** `0.008314`, the friction equations, the RMSProp
+  `beta1` mapping, cosine continuation, and the integration ordering are unchanged.
+
+Users of the affected operations should regenerate those derived results from
+their original trajectories when comparing software versions. These conditional
+defects do not establish that every prior simulation or analysis was affected.
+No research production trajectory was rerun for this update. See
+[numerical conventions](NUMERICAL_NOTES.md) for the exact API and unit contracts.
+
+The sections below retain the detailed implementation and verification record.
 
 ---
 
